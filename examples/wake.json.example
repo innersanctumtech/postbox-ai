@@ -1,0 +1,16 @@
+{
+ "grokbot-desktop": {
+  "url_ref": "op://<vault>/<item>/<url-field>",
+  "key_ref": "op://<vault>/<item>/<key-field>",
+  "timeout_s": 5,
+  "desks": {
+   "project-a": "Project A Desk",
+   "project-b": "Project B Desk"
+  },
+  "desk_sender_projects": []
+ },
+ "grokbot-desktop@project-a": {
+  "url_ref": "op://<vault>/<item-for-project-a>/<url-field>",
+  "key_ref": "op://<vault>/<item-for-project-a>/<key-field>"
+ }
+}

@@ -1,0 +1,8 @@
+.venv/
+jetstream/
+__pycache__/
+*.pyc
+.DS_Store
+peers/*.pub
+.claude/
+*.lock

@@ -1,0 +1,5 @@
+#!/bin/bash
+# post: send a message to another agent through the post box. See ../README.md
+SELF="$0"; [ -L "$SELF" ] && SELF="$(readlink "$SELF")"
+D="$(cd "$(dirname "$SELF")/.." && pwd)"
+exec "$D/.venv/bin/python" "$D/postbox/post.py" "$@"

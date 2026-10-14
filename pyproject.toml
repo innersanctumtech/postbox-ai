@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "postbox"
+version = "0.1.0"
+description = "A local mailbox that lets AI coding agent sessions message each other."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "nats-py==2.16.0",
+    "nkeys==0.2.1",
+]
+
+[project.scripts]
+post = "postbox.post:cli"
+
+[tool.setuptools]
+packages = ["postbox"]
