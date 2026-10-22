@@ -1102,6 +1102,25 @@ def codex_user_threads(cwd, since):
         return []
 
 
+def codex_user_thread_snapshot():
+    """The eligible user threads in one read, or None when this Codex table cannot distinguish subagents."""
+    import sqlite3
+    db = codex_state_db()
+    if not db:
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        if not {"thread_source", "created_at"} <= _codex_columns(con):
+            con.close()
+            return None
+        rows = con.execute("select id, cwd, updated_at, created_at from threads "
+                           "where archived=0 and thread_source='user' order by created_at desc").fetchall()
+        con.close()
+        return rows
+    except Exception:
+        return None
+
+
 def codex_thread_created(thread_id):
     import sqlite3
     db = codex_state_db()
@@ -1291,17 +1310,89 @@ def codex_sessions(table=None):
         if interactive:
             screens.append((pid, thread, cwd_of(pid)))
     claimed = {t for _p, t, _c in screens if t}
+    threads = codex_user_thread_snapshot()
+    now = time.time()
+    starts = {pid: (now - age - CODEX_THREAD_SLACK_S) if (age := process_age_s(pid)) is not None else None
+              for pid, _thread, _cwd in screens}
+    by_id = {tid: (cwd, updated, created) for tid, cwd, updated, created in threads} if threads is not None else {}
+
+    # Reserve arguments before assigning a conversation to any idless screen.  A process-list order must never let a plain
+    # `codex` screen steal a conversation another screen explicitly resumed.
+    explicit = {}
+    for pid, thread, proc_cwd in screens:
+        if not thread:
+            continue
+        moved = None
+        if threads is not None and starts[pid] is not None and proc_cwd:
+            launched = by_id.get(thread, ("", 0, 0))[2] or 0
+            newer = [tid for tid, cwd, _updated, created in threads
+                     if cwd == proc_cwd and tid != thread and tid not in claimed and created >= starts[pid] and created > launched]
+            if newer:
+                rivals = [p for p, _t, cwd in screens if p != pid and cwd == proc_cwd]
+                moved = "" if rivals else newer[0]
+        elif threads is None:
+            moved = _codex_moved_to(pid, thread, proc_cwd, claimed, screens)
+        explicit[pid] = moved if moved else thread
+        if moved == "":
+            explicit[pid] = ""
+    reserved = claimed | {thread for thread in explicit.values() if thread}
+
+    # An idless screen owns only a candidate that belongs to exactly one idless screen.  Siblings that could own the same
+    # conversation remain visible but unready, so queued mail cannot land in the wrong window.
+    idless = [(pid, proc_cwd) for pid, thread, proc_cwd in screens if not thread]
+    candidates = {}
+    if threads is not None:
+        for pid, proc_cwd in idless:
+            started = starts[pid]
+            if started is not None and proc_cwd:
+                own = [tid for tid, cwd, _updated, created in threads if cwd == proc_cwd and tid not in reserved and created >= started]
+                if own:
+                    candidates[pid] = own
+
+    # Only commit a pair when it is forced.  This resolves staggered screens (the later screen can only own the newer thread,
+    # leaving the earlier one its older thread) without guessing when sibling screens have the same candidate set.
+    assignments = {}
+    pending = {pid: list(own) for pid, own in candidates.items()}
+    while pending:
+        owners = {}
+        for pid, own in pending.items():
+            for tid in own:
+                owners.setdefault(tid, []).append(pid)
+        forced = next(((owners[tid][0], tid) for tid in sorted(owners) if len(owners[tid]) == 1), None)
+        if forced is None:
+            for pid in sorted(pending):
+                own = pending[pid]
+                if len(own) == 1 and all(len(pending[rival]) > 1 for rival in owners[own[0]] if rival != pid):
+                    forced = (pid, own[0])
+                    break
+        if forced is None:
+            break
+        pid, tid = forced
+        assignments[pid] = tid
+        del pending[pid]
+        for own in pending.values():
+            if tid in own:
+                own.remove(tid)
+        pending = {pid: own for pid, own in pending.items() if own}
+
     found = []
     for pid, thread, proc_cwd in screens:
         if thread:
-            # Launched as `codex resume <id>`, but the screen may since have started a NEW conversation in the same window (/new):
-            # the launch arguments still name the old one, and mail queued there is never read.
-            moved = _codex_moved_to(pid, thread, proc_cwd, claimed, screens)
-            if moved == "":
+            thread = explicit[pid]
+            if not thread:
                 found.append(_session("codex", pid, proc_cwd or "", "", ready=False))
                 continue
-            thread = moved or thread
-        info = codex_thread_info(thread_id=thread) if thread else codex_thread_info(cwd=proc_cwd)
+        elif pid in assignments:
+            thread = assignments[pid]
+        elif threads is not None:
+            found.append(_session("codex", pid, proc_cwd or "", "", ready=False))
+            continue
+        if threads is not None:
+            # The snapshot deliberately contains only active user threads for automatic matching.  An explicit `resume <id>`
+            # is different: it has always been allowed to address its exact thread, including an archived conversation.
+            info = (thread, *by_id[thread][:1]) if thread in by_id else codex_thread_info(thread_id=thread)
+        else:
+            info = codex_thread_info(thread_id=thread) if thread else codex_thread_info(cwd=proc_cwd)
         if not info:
             if not thread and proc_cwd:   # a screen with no conversation at all in its folder yet
                 found.append(_session("codex", pid, proc_cwd, "", ready=False))

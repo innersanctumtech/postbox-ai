@@ -58,13 +58,13 @@ con = make(DB)
 lib.codex_state_db = lambda: DB
 
 
-def put(tid, cwd, created, updated, source="user", c=None):
+def put(tid, cwd, created, updated, source="user", c=None, archived=0):
     c = c or con
     if source is None:
-        c.execute("insert or replace into threads (id, cwd, archived, updated_at, created_at) values (?,?,?,?,?)", (tid, cwd, 0, int(updated), int(created)))
+        c.execute("insert or replace into threads (id, cwd, archived, updated_at, created_at) values (?,?,?,?,?)", (tid, cwd, archived, int(updated), int(created)))
     else:
         c.execute("insert or replace into threads (id, cwd, archived, updated_at, created_at, thread_source) values (?,?,?,?,?,?)",
-                  (tid, cwd, 0, int(updated), int(created), source))
+                  (tid, cwd, archived, int(updated), int(created), source))
     c.commit()
 
 
@@ -137,7 +137,40 @@ AMBIG = {100: (1, ["node", "/x/bin/codex", "resume", OLD]), 200: (1, ["node", "/
 ss = lib.codex_sessions(AMBIG)
 check("the resumed screen is listed but not a delivery target (mail waits, not lost)", target(ss, 100) == ("", False), target(ss, 100))
 
-print("-- (f) an older Codex whose table has no thread_source: old behaviour")
+print("-- (f) an explicit resume target is reserved before matching an idless screen")
+clear()
+put(NEW, CWD, NOW - 300, NOW - 30)
+RESERVED = {100: (1, ["node", "/x/bin/codex"]), 200: (1, ["node", "/x/bin/codex", "resume", NEW])}
+ss = lib.codex_sessions(RESERVED)
+check("the idless screen cannot steal the explicitly resumed conversation", target(ss, 100) == ("", False), target(ss, 100))
+check("the resumed screen keeps its explicit target", target(ss, 200) == (NEW, True), target(ss, 200))
+
+print("-- (g) an explicit resume target can be archived")
+clear()
+put(OLD, CWD, NOW - 17 * DAY, NOW - 60, archived=1)
+t, ready = target(lib.codex_sessions(RESUMED))
+check("an archived explicitly resumed conversation remains ready", t == OLD and ready, (t, ready))
+
+print("-- (h) idless sibling screens competing for one candidate remain unready")
+clear()
+put(NEW, CWD, NOW - 300, NOW - 30)
+SIBLINGS = {100: (1, ["node", "/x/bin/codex"]), 200: (1, ["node", "/x/bin/codex"])}
+ss = lib.codex_sessions(SIBLINGS)
+check("the first sibling is unready rather than guessing", target(ss, 100) == ("", False), target(ss, 100))
+check("the second sibling is unready rather than guessing", target(ss, 200) == ("", False), target(ss, 200))
+
+print("-- (i) sequential idless screens receive their uniquely time-compatible conversations")
+clear()
+AGE.update({300: 900.0, 400: 600.0})
+CWDS.update({300: CWD, 400: CWD})
+put(NEW, CWD, NOW - 800, NOW - 700)
+put(NEW2, CWD, NOW - 500, NOW - 30)
+SEQUENTIAL = {300: (1, ["node", "/x/bin/codex"]), 400: (1, ["node", "/x/bin/codex"])}
+ss = lib.codex_sessions(SEQUENTIAL)
+check("the earlier screen receives only its compatible conversation", target(ss, 300) == (NEW, True), target(ss, 300))
+check("the later screen receives its newer conversation", target(ss, 400) == (NEW2, True), target(ss, 400))
+
+print("-- (j) an older Codex whose table has no thread_source: old behaviour")
 old_con = make(OLD_DB, modern=False)
 lib.codex_state_db = lambda: OLD_DB
 put(OLD, CWD, NOW - 17 * DAY, NOW - 3600, source=None, c=old_con)
