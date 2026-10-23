@@ -7,6 +7,7 @@ Run: .venv/bin/python tests/test_doors.py
 """
 import json
 import os
+import re
 os.environ["POSTBOX_TELEMETRY"] = "0"
 import shutil
 import socket
@@ -172,7 +173,9 @@ with tempfile.TemporaryDirectory() as tmp:
     code, out = install(env, "--no-launchd", "--port", "47999", "--force", "--update-claude-skill")
     check("--update-claude-skill replaces it with this repo's copy", claude_skill.read_bytes() == (ROOT / "claude-skill" / "post" / "SKILL.md").read_bytes(), out[-300:])
     plist = (home / "Library" / "LaunchAgents" / "com.postbox.relay.plist").read_text()
-    check("the relay's launchd PATH does not carry codex's folder when codex is off", "codex" not in plist.lower().replace("com.postbox", ""), plist)
+    path_match = re.search(r"<key>PATH</key>\s*<string>(.*?)</string>", plist, re.S)
+    relay_path = path_match.group(1) if path_match else ""
+    check("the relay's launchd PATH does not carry codex's folder when codex is off", path_match is not None and "codex" not in relay_path.lower(), plist)
 skill_text = (ROOT / "claude-skill" / "post" / "SKILL.md").read_text()
 check("the Claude skill has its front matter and names the post command", skill_text.startswith("---\nname: post\n") and "post claude" in skill_text)
 
