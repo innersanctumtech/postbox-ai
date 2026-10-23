@@ -22,6 +22,7 @@ import collections
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -54,6 +55,10 @@ FORWARD_RETRY_S = int(os.environ.get("POSTBOX_FORWARD_RETRY_S", "60"))   # a for
 FORWARD_CONNECT_S = 3           # how long one try to open the other Mac's mailbox may take
 FORWARD_REPLY_S = 8             # how long to wait for the other Mac's relay to answer a forwarded message
 FORWARD_LIMIT_REASONS = ("pair_limit", "recipient_limit")   # the other Mac refused for a stop rule: that clears with time, so the mail is kept and tried again
+STUCK_AFTER_S = int(os.environ.get("POSTBOX_STUCK_AFTER_S", "600"))
+# Optional portable notification hook.  It receives one JSON object on stdin;
+# no mail text, paths, command-line data, or inherited environment is exposed.
+STUCK_NOTIFY_CMD = shlex.split(os.environ.get("POSTBOX_STUCK_NOTIFY_CMD", ""))
 
 
 class RelayStats:
@@ -154,6 +159,41 @@ def message_age_s(hdr, queue_age, now=None):
 
 def busy_kinds(notes):
     return [kind for needle, kind in (("is mid-task", "mid_task"), ("cannot be woken", "cannot_wake")) if any(needle in str(n) for n in notes)]
+
+
+def stuck_notification(message_id, kind, frm, to, age_s, reason, limit_s):
+    """Emit one metadata-only public stuck-mail notice, returning its exact payload.
+
+    Hook failures are intentionally silent: delivery safety never depends on an
+    optional notification program and its output is not a relay log channel.
+    """
+    payload = {"id": str(message_id), "kind": str(kind), "frm": str(frm), "to": str(to),
+               "age_s": int(max(0, age_s)), "reason": str(reason), "limit_s": int(max(0, limit_s))}
+    if STUCK_NOTIFY_CMD:
+        try:
+            subprocess.run(STUCK_NOTIFY_CMD, input=json.dumps(payload, separators=(",", ":")).encode(),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, timeout=10, check=False)
+        except Exception:
+            pass
+    return payload
+
+
+async def notify_stuck(message_id, kind, frm, to, age_s, reason, limit_s):
+    """Run the optional hook off the relay event loop."""
+    return await asyncio.to_thread(stuck_notification, message_id, kind, frm, to, age_s, reason, limit_s)
+
+
+async def check_stuck_holds(now=None):
+    """Emit at most one metadata-only held-mail notice per threshold interval."""
+    try:
+        due = await asyncio.to_thread(lib.hold_stuck_due, STUCK_AFTER_S, now)
+    except Exception as exc:  # noqa: BLE001 - an optional alarm must not stall delivery
+        log("relay_error", error="held stuck check failed: " + type(exc).__name__)
+        return []
+    for item in due:
+        await notify_stuck(item["id"], item["kind"], item["frm"], item["to"], item["age_s"], item["reason"], item["limit_s"])
+    return due
 
 
 def decide(m, result, reason, started, facts, first_try, **extra):
@@ -417,6 +457,14 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
     want = lib.valid_session(want_raw) if want_raw else None
     facts.update(session_named=bool(want_raw), picked=bool(pick_id))
 
+    async def alarm_if_stuck(kind, reason):
+        """Queue/hold diagnostics are metadata-only and start only after the public limit."""
+        message_id = str(hdr.get("Nats-Msg-Id") or f"seq-{_seq}-{m.subject}")
+        due = waited is not None and await asyncio.to_thread(lib.stuck_notice_due, message_id, kind, waited, reason, STUCK_AFTER_S)
+        if due:
+            await notify_stuck(str(hdr.get("Nats-Msg-Id") or f"seq-{_seq}-{m.subject}"), kind, from_addr, to,
+                               waited, reason, STUCK_AFTER_S)
+
     if len(m.data) > lib.MAX_TEXT_BYTES:
         log("refused_too_long", frm=from_addr, to=to, bytes=len(m.data))
         await m.term()
@@ -515,6 +563,7 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
                                              reason=reason)
             await m.nak(delay=10)
             decide(m, "queued", reason, t_start, facts, first_try, targets_n=0, waiting_pids=[w.pid for w in waiting])
+            await alarm_if_stuck("queued", reason)
             return
         if first_try:   # same rule: one log line per message, not one per 10-second redelivery (otherwise one queued message looks like a send loop)
             log("nobody_there", frm=from_addr, to=to, first_try=first_try)
@@ -522,6 +571,7 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
                                          reason="nobody_there")
         await m.nak(delay=10)
         decide(m, "queued", "nobody_there", t_start, facts, first_try, targets_n=0)
+        await alarm_if_stuck("queued", "nobody_there")
         return
 
     if per_session:   # Claude and Codex: ONE session gets the message. Exactly one open, or the one named; anything else is held or refused, never "everyone".
@@ -554,6 +604,7 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
             log("held", frm=from_addr, to=to, hold=hold_id, sessions=open_n, ambiguous=outcome == "ambiguous")
             facts["reply"] = await reply(nc, inbox, "held", detail, [t.label for t in chosen], reason="ambiguous_name" if outcome == "ambiguous" else "several_sessions")
             decide(m, "held", "ambiguous_name" if outcome == "ambiguous" else "several_sessions", t_start, facts, first_try, targets_n=open_n, route="bounced_several", held_id=hold_id)
+            await alarm_if_stuck("held", "ambiguous_name" if outcome == "ambiguous" else "several_sessions")
             if late:   # the sender's command is over (the mail waited, or it came through the forwarder): the same bounce, as a message to its session
                 facts["notice"] = await notify_sender(nc, doors, from_addr, from_session, "Post box notice (no reply needed): " + detail)
             return
@@ -565,6 +616,7 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
     body = render(from_label, text, waited_s=int(waited), **kw) if stale else render(from_label, text, **kw)
     delivered, failed, notes, fail_classes = [], [], [], []
     t_deliver = time.monotonic()
+    watch_id = str(hdr.get("Nats-Msg-Id") or f"seq-{_seq}-{m.subject}")
     for t in targets:
         note = ""
         busy_note = getattr(door, "busy_note", None)
@@ -574,12 +626,25 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
             except Exception:  # noqa: BLE001
                 note = ""
         try:
+            # Reserve before the external queue call.  A crash after the call but
+            # before ack then redelivers this stream message, sees the same id,
+            # and waits for the normal one-shot recovery rather than duplicating it.
+            existing_watch = None
+            if agent == "codex" and isinstance(door, lib.CodexDoor):
+                existing_watch = await asyncio.to_thread(lib.codex_watch_get, watch_id)
+                if existing_watch and existing_watch.get("state") == "queued":
+                    delivered.append(t.label)
+                    continue
+                if existing_watch:
+                    failed.append(f"{t.label}: delivery outcome pending")
+                    fail_classes.append("PendingCodexDelivery")
+                    continue
+                await asyncio.to_thread(lib.codex_watch_reserve, watch_id, t, body, from_addr, from_session)
             await asyncio.to_thread(door.deliver, t, body)
             delivered.append(t.label)
-            watch = getattr(door, "watch", None)
-            if watch:   # Codex: prove the message reached the conversation that screen has open (codex_watch_check); never blocks delivery
+            if agent == "codex" and isinstance(door, lib.CodexDoor):
                 try:
-                    await asyncio.to_thread(watch, t, text, from_addr, from_session)
+                    await asyncio.to_thread(lib.codex_watch_mark_queued, watch_id)
                 except Exception as e:  # noqa: BLE001
                     log("relay_error", error="codex watch failed: " + repr(e)[:120])
             if note:
@@ -667,6 +732,31 @@ async def check_codex_seen(nc, doors=None):
         return []
     for e, result in settled:
         waited = int(time.time() - float(e.get("sent", time.time())))
+        if result in ("retry", "recover"):
+            door = doors.get("codex")
+            body, project = e.get("body"), e.get("project")
+            replacement = None
+            try:
+                snapshot = await asyncio.to_thread(door.candidates, project) if isinstance(door, lib.CodexDoor) and project else None
+                ready = snapshot.ready if snapshot else []
+                replacement = next((s for s in ready if s.target == e.get("thread")), None)
+                # A departed conversation may be replaced exactly once and only
+                # when the fresh snapshot names one unambiguous live target.
+                if replacement is None and not snapshot.waiting and not e.get("reroute_count") and len(ready) == 1:
+                    replacement = ready[0]
+                    e["reroute_count"] = 1
+                if not replacement or not body:
+                    raise RuntimeError("no exact recovery destination")
+                await asyncio.to_thread(door.deliver, replacement, body)
+                await asyncio.to_thread(lib.codex_watch_requeue, e.get("id"), replacement)
+                log("codex_recovery", to=replacement.label, frm=e.get("frm"), kind=result,
+                    rerouted=bool(replacement.target != e.get("thread")))
+                continue
+            except Exception as ex:  # noqa: BLE001 - a one-shot recovery must never guess or loop
+                log("codex_recovery_failed", to=e.get("to"), kind=result, error=type(ex).__name__)
+                # The persisted retry state settles as unseen in the next check,
+                # rather than issuing a second queue call.
+                continue
         if result == "seen":
             log("codex_seen", to=e.get("to"), frm=e.get("frm"), after_s=waited)
             tel.emit("post_codex_seen", "relay", status="ok", after_s=waited)
@@ -679,6 +769,8 @@ async def check_codex_seen(nc, doors=None):
                   f"and tell the person you work for if it happens again.")
         sent = await notify_sender(nc, doors, e.get("frm"), e.get("from_session") or None, notice)
         log("codex_unseen_notice", to=e.get("frm"), result=sent)
+        await notify_stuck(e.get("id", ""), "delivery", e.get("frm", "unknown"), e.get("to", "unknown"),
+                           waited, "thread_not_seen", int(lib.CODEX_SEEN_MAX_S))
         if ALARM_CMD and os.path.exists(ALARM_CMD):
             title = f"{lib.my_machine().capitalize()} post box: Codex missed a message"
             try:
@@ -889,6 +981,7 @@ async def main():
                     log("idle_quiet_start", round=quiet_rounds)   # quiet branch: the codex check runs next
                     await check_codex_seen(nc)
                     log("idle_quiet_codex_done")
+                    await check_stuck_holds()
                     if quiet_rounds % 12 == 0:
                         log("heartbeat")
                         try:   # unread inbox mail expires like queued mail (lib.MAX_AGE_S); a failed sweep must never stop the relay

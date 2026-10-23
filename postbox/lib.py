@@ -80,6 +80,51 @@ def support_dir() -> Path:
     return Path(os.environ.get("POSTBOX_SUPPORT_DIR") or Path.home() / "Library" / "Application Support" / "postbox")
 
 
+def _stuck_notice_file() -> Path:
+    return Path(os.environ.get("POSTBOX_STUCK_NOTICES") or support_dir() / "stuck-notices.json")
+
+
+def _stuck_notice_load():
+    try:
+        data = json.loads(_stuck_notice_file().read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _stuck_notice_save(rows):
+    path = _stuck_notice_file()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(".tmp-" + uuid.uuid4().hex[:12])
+    tmp.write_text(json.dumps(rows, separators=(",", ":")))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def stuck_notice_due(message_id, kind, age_s, reason, limit_s, now=None):
+    """Durably rate-limit a metadata-only stuck notification by message and reason."""
+    now = time.time() if now is None else now
+    limit_s = max(1, int(limit_s))
+    if age_s < limit_s:
+        return False
+    key = f"{kind}:{message_id}:{reason}"
+    rows = _stuck_notice_load()
+    try:
+        last = float(rows.get(key, 0))
+    except (TypeError, ValueError):
+        last = 0
+    if last and now - last < limit_s:
+        return False
+    # Bound this small private ledger by the stream's own retention horizon.
+    rows = {k: v for k, v in rows.items() if isinstance(v, (int, float)) and now - v <= MAX_AGE_S}
+    rows[key] = now
+    try:
+        _stuck_notice_save(rows)
+    except OSError:
+        return False
+    return True
+
+
 def project_aliases() -> dict:
     """aliases.json in the support folder: {"project-g": "project-g-full"} makes both names ONE project (mail, sessions, inboxes, wake entries).
     The right-hand name is the one shown. Missing or unreadable means no aliases. Read on every call (a tiny file), so an edit applies at once."""
@@ -1821,18 +1866,101 @@ def _codex_watch_save(rows) -> None:
     os.replace(tmp, path)
 
 
-def codex_watch_add(session, text, from_addr, from_session=None, now=None) -> None:
-    """Start watching for `text` in the conversation `session` points at, from the log's current end (older lines never count)."""
-    rollout = codex_thread_rollout(session.target)
+def _codex_watch_offset(thread):
+    """The current end of a conversation log, or None when it cannot be watched."""
+    rollout = codex_thread_rollout(thread)
     try:
         offset = os.path.getsize(rollout) if rollout else None
     except OSError:
         offset = None
+    return rollout, offset
+
+
+def codex_watch_reserve(message_id, session, text, from_addr, from_session=None, now=None):
+    """Persist an opaque delivery identity before queueing it, returning its stable record.
+
+    A redelivery that finds the same id MUST NOT make a second queue request.  The
+    body is private local runtime state (the file is mode 0600), never diagnostic
+    data, and is retained only while a delivery can need one bounded recovery.
+    """
+    message_id = str(message_id or "")
+    if not message_id:
+        raise ValueError("a Codex watch needs an opaque message id")
     rows = codex_watch_load()
-    rows.append({"thread": session.target, "rollout": str(rollout) if rollout else "", "offset": offset,
+    for row in rows:
+        if row.get("id") == message_id:
+            return row
+    rollout, offset = _codex_watch_offset(session.target)
+    row = {"id": message_id, "state": "reserved", "thread": session.target,
+           "project": session.project, "pid": session.pid,
+           "rollout": str(rollout) if rollout else "", "offset": offset,
                  "snippet": _flat(text)[:CODEX_SNIPPET], "to": session.label, "frm": from_addr, "from_session": from_session or "",
-                 "sent": time.time() if now is None else now})
+           "body": str(text), "sent": time.time() if now is None else now,
+           "retry_count": 0, "reroute_count": 0}
+    rows.append(row)
     _codex_watch_save(rows)
+    return row
+
+
+def codex_watch_get(message_id):
+    """Return a copy of one durable watch record, if a redelivery already owns it."""
+    for row in codex_watch_load():
+        if row.get("id") == str(message_id):
+            return row
+    return None
+
+
+def codex_watch_mark_queued(message_id, now=None):
+    """Commit one already-reserved watch after `codex queue` accepts it."""
+    rows = codex_watch_load()
+    for row in rows:
+        if row.get("id") == str(message_id):
+            row["state"] = "queued"
+            row["queued_at"] = time.time() if now is None else now
+            _codex_watch_save(rows)
+            return True
+    return False
+
+
+def codex_watch_requeue(message_id, session, now=None):
+    """Re-arm an existing one-shot recovery for its verified current conversation."""
+    rows = codex_watch_load()
+    for row in rows:
+        if row.get("id") != str(message_id):
+            continue
+        rollout, offset = _codex_watch_offset(session.target)
+        rerouted = row.get("thread") != session.target
+        row.update({"state": "queued", "thread": session.target, "project": session.project,
+                    "pid": session.pid, "to": session.label, "rollout": str(rollout) if rollout else "",
+                    "offset": offset, "sent": time.time() if now is None else now})
+        if rerouted:
+            row["reroute_count"] = int(row.get("reroute_count", 0)) + 1
+        _codex_watch_save(rows)
+        return True
+    return False
+
+
+def codex_watch_add(session, text, from_addr, from_session=None, now=None) -> None:
+    """Backward-compatible helper for callers without a stream message identity."""
+    message_id = "legacy-" + uuid.uuid4().hex
+    codex_watch_reserve(message_id, session, text, from_addr, from_session, now)
+    codex_watch_mark_queued(message_id, now)
+
+
+def _codex_turn_aborted(thread_id):
+    """Whether the newest task marker is an aborted turn; unknown is false."""
+    rollout = codex_thread_rollout(thread_id)
+    if not rollout:
+        return False
+    try:
+        with open(rollout, "rb") as fh:
+            fh.seek(0, 2)
+            start = max(0, fh.tell() - CODEX_TAIL_CHUNK)
+            fh.seek(start)
+            marks = list(CODEX_MARK_RE.finditer(fh.read()))
+            return bool(marks and marks[-1].group(1) == b"turn_aborted")
+    except OSError:
+        return False
 
 
 def _codex_log_has(rollout, offset, snippet) -> bool:
@@ -1864,11 +1992,15 @@ def _codex_log_has(rollout, offset, snippet) -> bool:
 
 
 def codex_watch_check(now=None) -> list:
-    """[(entry, 'seen'|'unseen')] for every watched message that is settled now; the settled ones leave the watch list. Never raises."""
+    """Return settled watches plus one bounded `retry`/`recover` request. Never raises."""
     now = time.time() if now is None else now
     rows, keep, settled = codex_watch_load(), [], []
     for e in rows:
         try:
+            state = e.get("state", "queued")
+            if state == "retry":
+                settled.append((e, "unseen"))
+                continue
             if not e.get("rollout") or e.get("offset") is None or not os.path.exists(e["rollout"]):
                 settled.append((e, "unseen"))
                 continue
@@ -1878,7 +2010,18 @@ def codex_watch_check(now=None) -> list:
             age = now - float(e.get("sent", now))
             busy = codex_busy_seconds(e.get("thread"), now) is not None
             if age >= CODEX_SEEN_MAX_S or (age >= CODEX_SEEN_AFTER_S and not busy):
-                settled.append((e, "unseen"))
+                if state == "reserved" and not e.get("recovery_count"):
+                    e["recovery_count"] = 1
+                    e["state"] = "recover"
+                    keep.append(e)
+                    settled.append((e, "recover"))
+                elif state == "queued" and _codex_turn_aborted(e.get("thread")) and not e.get("retry_count"):
+                    e["retry_count"] = 1
+                    e["state"] = "retry"
+                    keep.append(e)
+                    settled.append((e, "retry"))
+                else:
+                    settled.append((e, "unseen"))
             else:
                 keep.append(e)
         except Exception:  # noqa: BLE001 - a check that cannot read the log must still raise the alarm, not keep quiet
@@ -2073,6 +2216,46 @@ def hold_list(now=None):
             if rec is not None:
                 out.append(dict(rec, id=name[:-5]))
     return sorted(out, key=lambda r: (float(r.get("held_at") or 0), r["id"]))
+
+
+def _hold_save(hold_id, rec) -> bool:
+    """Atomically update private hold metadata without changing its stable id."""
+    path = _hold_path(hold_id)
+    tmp = path.with_name(".tmp-" + uuid.uuid4().hex[:12])
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        _unlink(tmp)
+        return False
+
+
+def hold_stuck_due(limit_s, now=None):
+    """Metadata-only held mail that has crossed its periodic notification threshold.
+
+    Marking the record before returning makes a quiet-loop restart safe: a hold
+    is reported once per threshold interval, never once per poll.
+    """
+    now = time.time() if now is None else now
+    limit_s = max(1, int(limit_s))
+    due = []
+    for rec in hold_list(now):
+        try:
+            age = max(0, int(now - float(rec.get("sent_at") or rec.get("held_at") or now)))
+            last = float(rec.get("stuck_notified_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if age < limit_s or (last and now - last < limit_s):
+            continue
+        rec["stuck_notified_at"] = now
+        if _hold_save(rec["id"], {k: v for k, v in rec.items() if k != "id"}):
+            due.append({"id": rec["id"], "kind": "held", "frm": rec.get("frm", "unknown"),
+                        "to": f"{rec.get('agent', 'unknown')}@{rec.get('project', 'unknown')}",
+                        "age_s": age, "reason": "held_ambiguous", "limit_s": limit_s})
+    return due
 
 
 def hold_get(hold_id, now=None):

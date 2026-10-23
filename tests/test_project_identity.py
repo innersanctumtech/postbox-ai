@@ -206,10 +206,14 @@ TABLE = {E_PID: (1, ["node", "/x/bin/codex"])}
 
 
 class Msg:
-    def __init__(self, project, agent="codex"):
+    next_stream = 1
+
+    def __init__(self, project, agent="codex", stream=None, delivered=1):
         self.subject, self.data = f"post.{project}.{agent}", b"hello"
         self.headers = {"From": "claude@myproj", "From-Pid": "1", "Reply-Inbox": "_INBOX.x"}
-        self.metadata = types.SimpleNamespace(num_delivered=1, sequence=types.SimpleNamespace(stream=1, consumer=1))
+        if stream is None:
+            stream, Msg.next_stream = Msg.next_stream, Msg.next_stream + 1
+        self.metadata = types.SimpleNamespace(num_delivered=delivered, sequence=types.SimpleNamespace(stream=stream, consumer=1))
         self.acked = self.naked = None
 
     async def ack(self): self.acked = True
@@ -236,8 +240,8 @@ class RecordingDoor(lib.CodexDoor):
     def deliver(self, session, text, timeout=25.0): self.handed.append(session.target)
 
 
-def mail(door, project):
-    nc, m = NC(), Msg(project)
+def mail(door, project, msg=None):
+    nc, m = NC(), (msg or Msg(project))
     with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(relay.tel, "emit", lambda *a, **k: True), env():
         asyncio.run(relay.handle(nc, m, {"codex": door}, lib.PairLimiter(), lib.PairLimiter(limit=100)))
     return nc.sent[0], m
@@ -265,6 +269,14 @@ a, _ = mail(door, "mac")
 check("after leave: codex@mac reaches it again", a["status"] == "delivered" and door.handed == [THREAD], a)
 a, _ = mail(door, "codex")
 check("after leave: codex@codex is queued again", a["status"] == "queued", a)
+
+print("-- stream identity distinguishes mail while retaining redelivery suppression")
+door = RecordingDoor()
+first = Msg("mac", stream=900)
+redelivery = Msg("mac", stream=900, delivered=2)
+a, first = mail(door, "mac", first)
+b, redelivery = mail(door, "mac", redelivery)
+check("the same stream message is delivered once across redelivery", first.acked and redelivery.acked and door.handed == [THREAD], (a, b, door.handed))
 
 print("-- (f) two different folders both named x are distinct once one has a marker")
 fx1, fx2 = folder("f1", "x"), folder("f2", "x")

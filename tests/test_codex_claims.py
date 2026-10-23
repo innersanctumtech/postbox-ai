@@ -44,7 +44,7 @@ check("public Python source avoids PEP 604 annotations for Python 3.9", not pep6
 
 
 screen = lib.Session("codex", 101, CWD, "project-a", THREAD, True)
-snapshot = [{"pid": 101, "start": "2026-10-23 12:00:00"}]
+snapshot = [{"pid": 101, "start": "2026-10-23T12:00:00"}]
 context = {"id": THREAD, "cwd": CWD, "created_at": NOW - 20, "updated_at": NOW, "source": "user"}
 
 
