@@ -361,7 +361,7 @@ check("a door that does not declare per_session keeps delivering to every match 
 cdoor = lib.CodexDoor()
 cdoor.deliver = lambda session, text, timeout=25.0: DELIVERED.append((session.pid, text))
 DELIVERED = []
-cdoor.resolve = lambda project, exclude_pid=None, sessions=None: [S(11, "fix-bug", agent="codex", sid="111111"), S(12, "review", agent="codex", sid="222222")]
+cdoor.sessions = lambda: [S(11, "fix-bug", agent="codex", sid="111111"), S(12, "review", agent="codex", sid="222222")]
 nc = handle(Msg("post.project-a.codex", "codex mail", hdr()), {"codex": cdoor})
 check("codex: several screens and no name is held too", nc.answer["status"] == "held" and DELIVERED == [] and "codex@project-a#fix-bug" in nc.answer["detail"], str(nc.answer))
 nc = handle(Msg("post.project-a.codex", "codex mail", hdr(**{"To-Session": "review"})), {"codex": cdoor})

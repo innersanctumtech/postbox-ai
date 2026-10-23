@@ -103,8 +103,7 @@ class NC:
 class SessionDoor(lib.CodexDoor):
     """The real door, fed a fixed session list instead of the process table; deliver() records instead of running `codex`."""
     def __init__(self, found): self.found, self.handed = found, []
-    def resolve(self, project, exclude_pid=None, sessions=None): return super().resolve(project, exclude_pid, self.found())
-    def waiting(self, project, exclude_pid=None, sessions=None): return super().waiting(project, exclude_pid, self.found())
+    def sessions(self): return self.found()
     def busy_note(self, session, now=None): return ""
     def deliver(self, session, text, timeout=25.0): self.handed.append((session.target, text))
 
@@ -200,6 +199,41 @@ check("a redelivery (third try) logs nothing but still keeps the mail (nak 10 s)
 t1, _ = handle_out(SessionDoor(sessions), 1)
 t4, m4 = handle_out(SessionDoor(sessions), 4)
 check("thread_not_ready: first try logs, a redelivery does not, the mail is kept", '"thread_not_ready"' in t1 and '"thread_not_ready"' not in t4 and m4.naked == 10)
+
+print("-- candidate discovery is one worker snapshot")
+class BlockingSnapshotDoor(SessionDoor):
+    def __init__(self, found):
+        super().__init__(found)
+        self.calls = 0
+        self.started = __import__("threading").Event()
+        self.release = __import__("threading").Event()
+        self.callback_released = False
+
+    def sessions(self):
+        self.calls += 1
+        self.started.set()
+        self.callback_released = self.release.wait(.25)
+        return self.found()
+
+
+async def blocking_candidate_handle(door):
+    nc, m, events = NC(), Msg(), []
+    task = asyncio.create_task(relay.handle(nc, m, {"codex": door}, lib.PairLimiter(), lib.PairLimiter(limit=100)))
+    await asyncio.to_thread(door.started.wait, 1)
+    asyncio.get_running_loop().call_soon(lambda: (events.append("loop callback"), door.release.set()))
+    with mock.patch.object(relay.tel, "emit", lambda *a, **k: events.append((a, k))):
+        await task
+    return nc, m, events
+
+
+clear()
+set_thread(LIVE, "/home/u/.codex", STARTED + 30)
+blocking = BlockingSnapshotDoor(sessions)
+candidate_result = blocking.candidates(".codex")
+check("candidates() projects ready and waiting from one discovery", [s.target for s in candidate_result.ready] == [LIVE] and candidate_result.waiting == [] and blocking.calls == 1)
+blocking = BlockingSnapshotDoor(sessions)
+nc, m, events = asyncio.run(blocking_candidate_handle(blocking))
+check("relay discovery blocks for a loop callback, proving worker-thread ordering", blocking.callback_released and events[0] == "loop callback" and blocking.calls == 1 and m.acked and nc.sent[0][1]["status"] == "delivered", events)
 
 print("-- process_age_s parses ps etime")
 import importlib  # noqa: E402

@@ -485,34 +485,36 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
         facts.update(tel.text_facts(text), bytes=len(text.encode("utf-8", "replace")))
 
     t_resolve = time.monotonic()
-    if agent == "codex" and from_thread:
-        targets = await asyncio.to_thread(door.resolve, project, from_pid, None, from_thread)
+    if agent == "codex" and isinstance(door, lib.CodexDoor):
+        candidate_snapshot = await asyncio.to_thread(door.candidates, project, from_pid)
+        targets = candidate_snapshot.ready
+        waiting = candidate_snapshot.waiting
+        has_context_claim = candidate_snapshot.has_context_claim
+        if from_thread:
+            targets = [s for s in targets if s.target != from_thread]
+        # A project address cannot choose among a ready context claim and another unresolved screen.
+        # A named address remains exact and is handled by the normal session selection below.
+        if not want and waiting:
+            targets = []
     else:
         targets = await asyncio.to_thread(door.resolve, project, from_pid)
+        waiting = await asyncio.to_thread(door.waiting, project, from_pid) if hasattr(door, "waiting") else []
+        has_context_claim = False
     facts["resolve_ms"] = tel.elapsed_ms(t_resolve)
     per_session = getattr(door, "per_session", False)
     route = None
-    unresolved = await asyncio.to_thread(door.unresolved, project, from_pid) if agent == "codex" and hasattr(door, "unresolved") and not want else []
-    if unresolved and targets:
-        if first_try:
-            log("claim_not_ready", frm=from_addr, to=to, pids=[w.pid for w in unresolved])
-            facts["reply"] = await reply(nc, inbox, "queued", f"an unresolved Codex sibling screen is open in {project}; kept for {lib.ago(lib.MAX_AGE_S)} until its exact conversation is known",
-                                         reason="claim_not_ready")
-        await m.nak(delay=10)
-        decide(m, "queued", "claim_not_ready", t_start, facts, first_try, targets_n=0, waiting_pids=[w.pid for w in unresolved])
-        return
     if not targets and pick_id:
         await refuse("pick_nobody", f"no {agent} session is open in {project} right now, so held message {held['id']} stays held: try `post pick` again when one is", "refused_pick")
         return
     if not targets:
-        waiting = await asyncio.to_thread(door.waiting, project, from_pid) if hasattr(door, "waiting") else []
         if waiting:   # the screen is open but has not started its own conversation: mail would go into an older, dead thread
+            reason = "claim_not_ready" if has_context_claim else "thread_not_ready"
             if first_try:   # a waiting message is redelivered every 10 s on purpose; only the first decision is logged (retries are counted in decide)
-                log("thread_not_ready", frm=from_addr, to=to, first_try=first_try, pids=[w.pid for w in waiting])
+                log(reason, frm=from_addr, to=to, first_try=first_try, pids=[w.pid for w in waiting])
                 facts["reply"] = await reply(nc, inbox, "queued", f"the {agent.title()} screen in {project} has not started a conversation yet; kept for {lib.ago(lib.MAX_AGE_S)} and delivered when it does",
-                                             reason="thread_not_ready")
+                                             reason=reason)
             await m.nak(delay=10)
-            decide(m, "queued", "thread_not_ready", t_start, facts, first_try, targets_n=0, waiting_pids=[w.pid for w in waiting])
+            decide(m, "queued", reason, t_start, facts, first_try, targets_n=0, waiting_pids=[w.pid for w in waiting])
             return
         if first_try:   # same rule: one log line per message, not one per 10-second redelivery (otherwise one queued message looks like a send loop)
             log("nobody_there", frm=from_addr, to=to, first_try=first_try)

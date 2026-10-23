@@ -1711,12 +1711,46 @@ class ClaudeDoor:
             s.close()
 
 
+@dataclass
+class CodexCandidates:
+    """One discovery pass projected into routing candidates and diagnostic metadata."""
+    ready: list
+    waiting: list
+    has_context_claim: bool = False
+
+
 class CodexDoor:
     agent = "codex"
     per_session = True
 
+    def sessions(self):
+        return codex_sessions()
+
+    def candidates(self, project, exclude_pid=None):
+        """Discover once, then project ready and waiting screens from that same snapshot."""
+        # Older synthetic doors provide their own projections instead of a sessions()
+        # source.  Keep that seam: their projection is already their snapshot.
+        overridden = ("resolve" in self.__dict__ or "waiting" in self.__dict__
+                      or type(self).resolve is not CodexDoor.resolve
+                      or type(self).waiting is not CodexDoor.waiting)
+        if overridden:
+            return CodexCandidates(
+                ready=self.resolve(project, exclude_pid),
+                waiting=self.waiting(project, exclude_pid),
+            )
+        sessions = self.sessions()
+        direct = [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and s.ready]
+        claims = thread_context_claims(project, sessions=sessions)
+        merged = {s.target: s for s in direct}
+        merged.update({s.target: s for s in claims})
+        return CodexCandidates(
+            ready=list(merged.values()),
+            waiting=[s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and not s.ready],
+            has_context_claim=bool(claims),
+        )
+
     def resolve(self, project, exclude_pid=None, sessions=None, exclude_thread=None):
-        sessions = codex_sessions() if sessions is None else sessions
+        sessions = self.sessions() if sessions is None else sessions
         direct = [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and s.ready]
         claims = thread_context_claims(project, sessions=sessions)
         merged = {s.target: s for s in direct}
@@ -1725,7 +1759,7 @@ class CodexDoor:
 
     def waiting(self, project, exclude_pid=None, sessions=None):
         """Screens in this project that are open but have no conversation of their own yet (mail for them is kept, not delivered)."""
-        sessions = codex_sessions() if sessions is None else sessions
+        sessions = self.sessions() if sessions is None else sessions
         return [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and not s.ready]
 
     def unresolved(self, project, exclude_pid=None, sessions=None):

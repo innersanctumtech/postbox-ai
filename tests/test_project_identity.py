@@ -225,9 +225,13 @@ class NC:
 
 class RecordingDoor(lib.CodexDoor):
     """The real Codex door fed the real session finder (fake process table); deliver() records instead of running `codex`."""
-    def __init__(self): self.handed = []
-    def resolve(self, project, exclude_pid=None, sessions=None): return super().resolve(project, exclude_pid, lib.codex_sessions(TABLE))
-    def waiting(self, project, exclude_pid=None, sessions=None): return super().waiting(project, exclude_pid, lib.codex_sessions(TABLE))
+    def __init__(self): self.handed, self.projections = [], []
+    def resolve(self, project, exclude_pid=None, sessions=None):
+        self.projections.append("resolve")
+        return super().resolve(project, exclude_pid, lib.codex_sessions(TABLE))
+    def waiting(self, project, exclude_pid=None, sessions=None):
+        self.projections.append("waiting")
+        return super().waiting(project, exclude_pid, lib.codex_sessions(TABLE))
     def busy_note(self, session, now=None): return ""
     def deliver(self, session, text, timeout=25.0): self.handed.append(session.target)
 
@@ -242,6 +246,7 @@ def mail(door, project):
 door = RecordingDoor()
 a, _ = mail(door, "mac")
 check("before: codex@mac reaches the session", a["status"] == "delivered" and door.handed == [THREAD], a)
+check("candidate discovery honors the overridden synthetic projections", door.projections == ["resolve", "waiting"], door.projections)
 a, _ = mail(door, "codex")
 check("before: codex@codex finds nobody (queued, nobody_there)", a["status"] == "queued" and a["reason"] == "nobody_there", a)
 lib.declare("codex", E_PID, "codex")
