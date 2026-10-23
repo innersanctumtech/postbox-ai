@@ -391,7 +391,8 @@ else:
             who = subprocess.run([str(ROOT / "bin" / "post"), "who"], env=live_env, capture_output=True, text=True, timeout=30)
             check("`post who` answers through it", who.returncode == 0 and "Reachable now" in who.stdout, who.stdout + who.stderr)
             ghost = f"pbinstalltest{port}"
-            sent = subprocess.run([str(ROOT / "bin" / "post"), f"claude@{ghost}", "installer live check, please ignore"], env=live_env, capture_output=True, text=True, timeout=30)
+            sent_env = dict(live_env, POSTBOX_AS=f"claude@{ghost}")
+            sent = subprocess.run([str(ROOT / "bin" / "post"), f"claude@{ghost}", "installer live check, please ignore"], env=sent_env, capture_output=True, text=True, timeout=30)
             check("a message makes the full trip (post to mailbox to relay and back) and is answered", sent.returncode == 3 and sent.stdout.startswith("queued: nobody reachable"), sent.stdout + sent.stderr)
             venv_env = live_env
             ok_run = subprocess.run([str(venv_python), str(ROOT / "postbox" / "selfcheck.py")], env=venv_env, capture_output=True, text=True, timeout=60)
