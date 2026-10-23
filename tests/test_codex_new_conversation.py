@@ -170,7 +170,20 @@ ss = lib.codex_sessions(SEQUENTIAL)
 check("the earlier screen receives only its compatible conversation", target(ss, 300) == (NEW, True), target(ss, 300))
 check("the later screen receives its newer conversation", target(ss, 400) == (NEW2, True), target(ss, 400))
 
-print("-- (j) an older Codex whose table has no thread_source: old behaviour")
+print("-- (j) overlapping idless candidates remain unready unless an edge is forced")
+clear()
+AGE.update({500: 1200.0, 600: 900.0})
+CWDS.update({500: CWD, 600: CWD})
+T1, T2, T3 = OLD, NEW, NEW2
+put(T1, CWD, NOW - 1100, NOW - 1000)
+put(T2, CWD, NOW - 800, NOW - 700)
+put(T3, CWD, NOW - 700, NOW - 30)
+OVERLAP = {500: (1, ["node", "/x/bin/codex"]), 600: (1, ["node", "/x/bin/codex"])}
+ss = lib.codex_sessions(OVERLAP)
+check("the first overlap screen is unready rather than taking its exclusive-looking candidate", target(ss, 500) == ("", False), target(ss, 500))
+check("the second overlap screen is unready while its sibling remains ambiguous", target(ss, 600) == ("", False), target(ss, 600))
+
+print("-- (k) an older Codex whose table has no thread_source: old behaviour")
 old_con = make(OLD_DB, modern=False)
 lib.codex_state_db = lambda: OLD_DB
 put(OLD, CWD, NOW - 17 * DAY, NOW - 3600, source=None, c=old_con)

@@ -1135,6 +1135,30 @@ def codex_thread_created(thread_id):
         return None
 
 
+def _codex_unique_matching(candidates):
+    """The sole full screen-to-thread matching, else None.  A bounded search fails closed on a large ambiguous component."""
+    solutions, visits = [], 0
+
+    def search(pending, chosen, used):
+        nonlocal visits
+        if len(solutions) > 1 or visits >= 10000:
+            return
+        if not pending:
+            solutions.append(chosen)
+            return
+        options = [(len([tid for tid in own if tid not in used]), pid, own) for pid, own in pending.items()]
+        _count, pid, own = min(options)
+        for tid in sorted(tid for tid in own if tid not in used):
+            visits += 1
+            search({other: choices for other, choices in pending.items() if other != pid},
+                   {**chosen, pid: tid}, used | {tid})
+            if len(solutions) > 1 or visits >= 10000:
+                return
+
+    search(candidates, {}, set())
+    return solutions[0] if len(solutions) == 1 and visits < 10000 else None
+
+
 def codex_thread_updated(thread_id):
     """Seconds-since-epoch the thread was last updated, from Codex's thread table (read-only), else None."""
     import sqlite3
@@ -1349,31 +1373,30 @@ def codex_sessions(table=None):
                 if own:
                     candidates[pid] = own
 
-    # Only commit a pair when it is forced.  This resolves staggered screens (the later screen can only own the newer thread,
-    # leaving the earlier one its older thread) without guessing when sibling screens have the same candidate set.
+    # Only resolve an entire connected component when its full bipartite matching is unique.  A locally exclusive-looking edge
+    # can still be optional when its screen has alternatives, so component-level proof is required before delivering mail.
     assignments = {}
-    pending = {pid: list(own) for pid, own in candidates.items()}
-    while pending:
-        owners = {}
-        for pid, own in pending.items():
-            for tid in own:
-                owners.setdefault(tid, []).append(pid)
-        forced = next(((owners[tid][0], tid) for tid in sorted(owners) if len(owners[tid]) == 1), None)
-        if forced is None:
-            for pid in sorted(pending):
-                own = pending[pid]
-                if len(own) == 1 and all(len(pending[rival]) > 1 for rival in owners[own[0]] if rival != pid):
-                    forced = (pid, own[0])
-                    break
-        if forced is None:
-            break
-        pid, tid = forced
-        assignments[pid] = tid
-        del pending[pid]
-        for own in pending.values():
-            if tid in own:
-                own.remove(tid)
-        pending = {pid: own for pid, own in pending.items() if own}
+    owners = {}
+    for pid, own in candidates.items():
+        for tid in own:
+            owners.setdefault(tid, set()).add(pid)
+    unseen = set(candidates)
+    while unseen:
+        component, threads, stack = set(), set(), [unseen.pop()]
+        while stack:
+            pid = stack.pop()
+            if pid in component:
+                continue
+            component.add(pid)
+            for tid in candidates[pid]:
+                threads.add(tid)
+                for rival in owners[tid]:
+                    if rival not in component:
+                        stack.append(rival)
+        unseen -= component
+        matched = _codex_unique_matching({pid: candidates[pid] for pid in component})
+        if matched:
+            assignments.update(matched)
 
     found = []
     for pid, thread, proc_cwd in screens:
