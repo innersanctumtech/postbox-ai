@@ -1788,9 +1788,11 @@ class CodexDoor:
         claims = thread_context_claims(project, sessions=sessions)
         merged = {s.target: s for s in direct}
         merged.update({s.target: s for s in claims})
+        claimed_pids = {s.pid for s in claims}
         return CodexCandidates(
             ready=list(merged.values()),
-            waiting=[s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and not s.ready],
+            waiting=[s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and not s.ready
+                     and s.pid not in claimed_pids],
             has_context_claim=bool(claims),
         )
 

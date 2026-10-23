@@ -914,6 +914,16 @@ async def answer_who(nc, msg):
     tel.emit("post_who", "relay", side="answered", sessions_n=len(sessions), by_agent=dict(collections.Counter(s.agent for s in sessions)))
 
 
+async def handle_batch(nc, msgs):
+    """Settle each fetched message independently so one retry never starves later mail."""
+    for m in msgs:
+        try:
+            await handle(nc, m)
+        except Exception as e:  # noqa: BLE001 - retain this one message, then continue its batch
+            log("handle_error", error=repr(e))
+            await m.nak(delay=10)
+
+
 def throttled_error_logger():
     """A connection error callback that writes ONE relay_error line per distinct error per minute. Without it nats-py prints a traceback
     several times a second while a login is refused (about 20 MB a day), and the health check never sees an error line."""
@@ -969,7 +979,9 @@ async def main():
                 log("idle_wait")   # the loop is about to wait on NATS; if the next line never comes, fetch is the stall
                 msgs = []
                 try:
-                    msgs = await psub.fetch(1, timeout=25)
+                    # A failed old message is NAKed below; fetch a bounded batch so it
+                    # cannot starve later mail that is already waiting in the stream.
+                    msgs = await psub.fetch(20, timeout=25)
                     log("idle_wake", msgs=len(msgs))
                 except NatsTimeout:
                     pass
@@ -1008,12 +1020,7 @@ async def main():
                             raise RuntimeError("the forwarder stopped: " + repr(forwarder.exception() if not forwarder.cancelled() else "cancelled")[:120])
                     await maybe_summary(js)
                     log("idle_quiet_end", round=quiet_rounds)
-                for m in msgs:
-                    try:
-                        await handle(nc, m)
-                    except Exception as e:  # noqa: BLE001
-                        log("handle_error", error=repr(e))
-                        await m.nak(delay=10)
+                await handle_batch(nc, msgs)
                 await maybe_summary(js)
         except Exception as e:  # noqa: BLE001
             log("relay_error", error=repr(e))
