@@ -235,6 +235,16 @@ blocking = BlockingSnapshotDoor(sessions)
 nc, m, events = asyncio.run(blocking_candidate_handle(blocking))
 check("relay discovery blocks for a loop callback, proving worker-thread ordering", blocking.callback_released and events[0] == "loop callback" and blocking.calls == 1 and m.acked and nc.sent[0][1]["status"] == "delivered", events)
 
+print("-- validated claims suppress only their own waiting screen")
+claimed_ready = lib.Session("codex", 71, "/x/project", "project", LIVE, True)
+same_screen_waiting = lib.Session("codex", 71, "/x/project", "project", "", False)
+other_waiting = lib.Session("codex", 72, "/x/project", "project", "", False)
+with mock.patch.object(lib, "thread_context_claims", return_value=[claimed_ready]):
+    snapshot = SessionDoor(lambda: [same_screen_waiting]).candidates("project")
+    check("a validated claim suppresses its same-PID unresolved duplicate", [s.target for s in snapshot.ready] == [LIVE] and snapshot.waiting == [], snapshot)
+    snapshot = SessionDoor(lambda: [same_screen_waiting, other_waiting]).candidates("project")
+    check("a distinct unresolved sibling remains visible", [s.pid for s in snapshot.waiting] == [72], snapshot)
+
 print("-- process_age_s parses ps etime")
 import importlib  # noqa: E402
 importlib.reload(lib)
