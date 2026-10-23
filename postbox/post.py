@@ -305,7 +305,7 @@ def mail_headers(me, remote, inbox=None, extra=None):
     }
     if inbox:
         headers["Reply-Inbox"] = inbox
-    headers.update({k: str(v) for k, v in (extra or {}).items() if v})
+    headers.update({k: str(v) for k, v in (extra or {}).items() if v and (k != "From-Thread" or not remote)})
     if not remote and me[2] is not None:   # a process number means nothing on another Mac (never sent there), and a stated --as identity has none
         headers["From-Pid"] = str(me[2])
     return headers
@@ -583,7 +583,8 @@ def main(argv):
         from_session = None
     note(to_session=bool(to_session), from_session=bool(from_session))
     MAIL_EXTRA.clear()
-    MAIL_EXTRA.update({"From-Session": from_session, "To-Session": to_session, "Pick": pick_id})   # headers for send(): who I am by name, which session this is for
+    sender_thread = lib.codex_sender_thread(me) if to_machine is None else None
+    MAIL_EXTRA.update({"From-Session": from_session, "From-Thread": sender_thread, "To-Session": to_session, "Pick": pick_id})   # headers for send(): who I am by name, which session this is for
     text = sys.stdin.read() if rest == ["-"] else " ".join(rest)
     text = text.strip()
     if not text:

@@ -836,11 +836,11 @@ def grok_identity():
     seen, pid = set(), os.getpid()
     for _ in range(20):
         if pid <= 1 or pid in seen:
-            return None
+            break
         seen.add(pid)
         fields = _run(["ps", "-p", str(pid), "-o", "ppid=,comm="]).strip().split(None, 1)
         if len(fields) != 2 or not fields[0].isdigit():
-            return None
+            break
         parent, executable = fields
         if pid in rows and GROK_COMM_RE.match(os.path.basename(executable)):
             cwd = rows[pid]["cwd"]
@@ -1031,6 +1031,9 @@ CODEX_VALUE_FLAGS = {
 }
 CODEX_THREAD_SLACK_S = float(os.environ.get("POSTBOX_CODEX_THREAD_SLACK_S", "5"))   # clock slack between a screen's start and its thread row
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+CODEX_CLAIM_VERSION = 1
+CODEX_CLAIM_TTL_S = float(os.environ.get("POSTBOX_CODEX_CLAIM_TTL_S", "300"))
+CODEX_CLAIM_MAX_BYTES = 8192
 
 
 def codex_screen_args(argv):
@@ -1076,6 +1079,185 @@ def codex_thread_info(thread_id=None, cwd=None, active_only=False):
         return row
     except Exception:
         return None
+
+
+def codex_thread_context(thread_id):
+    """The active, user-owned context for an exact Codex thread, or None.
+
+    A claim is deliberately stricter than the legacy explicit-resume lookup:
+    older Codex databases that cannot distinguish a subagent are not claimable.
+    """
+    import sqlite3
+    if not UUID_RE.fullmatch(str(thread_id or "")):
+        return None
+    db = codex_state_db()
+    if not db:
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        columns = _codex_columns(con)
+        needed = {"thread_source", "created_at", "updated_at"}
+        if not needed <= columns:
+            con.close()
+            return None
+        row = con.execute("select id, cwd, created_at, updated_at, thread_source from threads "
+                          "where id=? and archived=0", (thread_id,)).fetchone()
+        con.close()
+    except Exception:
+        return None
+    if not row or row[4] != "user" or not isinstance(row[1], str) or not os.path.isabs(row[1]) or not row[1].strip("/"):
+        return None
+    try:
+        return {"id": row[0], "cwd": row[1], "created_at": float(row[2]), "updated_at": float(row[3]), "source": row[4]}
+    except (TypeError, ValueError):
+        return None
+
+
+def codex_context_screen_snapshot(table=None):
+    """Native interactive Codex screen identity, including start times against PID reuse."""
+    table = process_table() if table is None else table
+    out = []
+    for pid, (_parent, argv) in sorted(table.items()):
+        args = _codex_wrapper_args(argv)
+        if args is not None and codex_screen_args(args)[0]:
+            started = process_start(pid)
+            if started:
+                out.append({"pid": pid, "start": started})
+    return out
+
+
+def _codex_claim_dir() -> Path:
+    return support_dir() / "codex-claims"
+
+
+def _codex_claim_path(thread_id) -> Optional[Path]:
+    return _codex_claim_dir() / f"{thread_id}.json" if UUID_RE.fullmatch(str(thread_id or "")) else None
+
+
+def _codex_claim_screens(value):
+    if not isinstance(value, list):
+        return None
+    rows = []
+    for item in value:
+        if not isinstance(item, dict) or not isinstance(item.get("pid"), int) or isinstance(item["pid"], bool) or not isinstance(item.get("start"), str):
+            return None
+        rows.append({"pid": item["pid"], "start": item["start"]})
+    return sorted(rows, key=lambda x: x["pid"])
+
+
+def thread_context_claim_write(record):
+    """Atomically persist one small, private claim.  Bad input is never written."""
+    thread = str((record or {}).get("thread") or "")
+    path = _codex_claim_path(thread)
+    screens = _codex_claim_screens((record or {}).get("screens"))
+    if path is None or screens is None:
+        return False
+    payload = dict(record, version=CODEX_CLAIM_VERSION, thread=thread, screens=screens)
+    try:
+        data = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if len(data.encode()) > CODEX_CLAIM_MAX_BYTES:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(data)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def _claim_record(thread_id):
+    path = _codex_claim_path(thread_id)
+    if path is None:
+        return None
+    try:
+        if path.stat().st_size > CODEX_CLAIM_MAX_BYTES:
+            return None
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def thread_context_claim_read(thread_id, now=None, sessions=None, snapshot=None):
+    """A currently exact claim as a Session, else None.  Every mismatch fails closed."""
+    now = time.time() if now is None else now
+    rec = _claim_record(thread_id)
+    if not rec or rec.get("version") != CODEX_CLAIM_VERSION or rec.get("thread") != thread_id:
+        return None
+    screens = _codex_claim_screens(rec.get("screens"))
+    if screens is None or screens != _codex_claim_screens(snapshot if snapshot is not None else codex_context_screen_snapshot()):
+        return None
+    try:
+        if float(rec["expires_at"]) < now or not isinstance(rec["cwd"], str) or not isinstance(rec["project"], str):
+            return None
+        created = float(rec["created_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    owner = [row for row in screens if row["pid"] == rec.get("owner_pid") and row["start"] == rec.get("owner_start")]
+    if len(owner) != 1:
+        return None
+    context = codex_thread_context(thread_id)
+    if not context or context["cwd"] != rec["cwd"] or context["created_at"] != created:
+        return None
+    user_threads = codex_user_thread_snapshot()
+    try:
+        newer = any(cwd == rec["cwd"] and float(created_at) > created for _tid, cwd, _updated, created_at in (user_threads or []))
+    except (TypeError, ValueError):
+        return None
+    if user_threads is None or newer:
+        return None
+    found = codex_sessions() if sessions is None else sessions
+    owned = [s for s in found if s.pid == rec.get("owner_pid") and s.target == thread_id and s.ready
+             and s.cwd == rec["cwd"] and s.project == rec["project"]]
+    return owned[0] if len(owned) == 1 else None
+
+
+def thread_context_claims(project=None, now=None, sessions=None, snapshot=None):
+    """All current claims, optionally in one project. Invalid and expired records are ignored."""
+    try:
+        files = list(_codex_claim_dir().glob("*.json"))
+    except OSError:
+        return []
+    found = codex_sessions() if sessions is None else sessions
+    snap = codex_context_screen_snapshot() if snapshot is None else snapshot
+    rows = []
+    for path in files:
+        thread = path.stem
+        claim = thread_context_claim_read(thread, now, found, snap)
+        if claim and (project is None or same_project(claim.project, project)):
+            rows.append(claim)
+    return rows
+
+
+def codex_claim_self(now=None):
+    """Claim the exact visible screen for this active user thread, including shared app-server callers."""
+    thread = os.environ.get("CODEX_THREAD_ID", "")
+    context = codex_thread_context(thread)
+    if not context or context.get("source") != "user":
+        return None
+    snapshot = codex_context_screen_snapshot()
+    sessions = codex_sessions()
+    matching = [s for s in sessions if s.target == thread and s.ready and s.cwd == context["cwd"]
+                and any(row["pid"] == s.pid for row in snapshot)]
+    if len(matching) != 1:
+        return None
+    session = matching[0]
+    owner = next(row for row in snapshot if row["pid"] == session.pid)
+    stamp = time.time() if now is None else now
+    record = {"thread": thread, "cwd": context["cwd"], "project": session.project, "created_at": context["created_at"],
+              "owner_pid": session.pid, "owner_start": owner["start"], "screens": snapshot, "expires_at": stamp + CODEX_CLAIM_TTL_S}
+    return session if thread_context_claim_write(record) else None
+
+
+def codex_sender_thread(me):
+    """The exact local thread safe to put in a sender-exclusion header, else None."""
+    if not me or me[0] != "codex":
+        return None
+    claim = codex_claim_self()
+    return claim.target if claim and claim.project == me[1] else None
 
 
 def _codex_columns(con):
@@ -1277,21 +1459,28 @@ def native_sender_identity(thread_id):
     seen, pid = set(), os.getpid()
     for _ in range(20):
         if pid <= 1 or pid in seen:
-            return None
+            break
         seen.add(pid)
         fields = _run(["ps", "-p", str(pid), "-o", "ppid=,comm="]).strip().split(None, 1)
         if len(fields) != 2 or not fields[0].isdigit():
-            return None
+            break
         parent, executable = fields
         if os.path.isabs(executable) and os.path.basename(executable) == "codex":
-            info = codex_thread_info(thread_id=thread_id, active_only=True)
-            if not info or info[0] != thread_id:
+            info = codex_thread_context(thread_id)
+            if info and info.get("source") != "user":
                 return None
-            cwd = info[1]
+            # Keep a directly descended legacy screen working, but never let that older ambiguous table create a shared-server claim.
+            cwd = info["cwd"] if info else (codex_thread_info(thread_id=thread_id, active_only=True) or (None, None))[1]
             if not isinstance(cwd, str) or not os.path.isabs(cwd) or not cwd.strip("/"):
                 return None
             return "codex", _identity_project("codex", pid, cwd), pid
         pid = int(parent)
+    # The app server can own CODEX_THREAD_ID without being descended from the native screen.  That is safe only after an
+    # exact, current screen claim binds the runtime thread to the visible screen set.
+    claim = codex_claim_self()
+    if claim:
+        IDENTITY_PROJECT["info"] = ProjectInfo(claim.project, claim.source, claim.where, claim.note)
+        return "codex", claim.project, claim.pid
     return None
 
 
@@ -1526,14 +1715,23 @@ class CodexDoor:
     agent = "codex"
     per_session = True
 
-    def resolve(self, project, exclude_pid=None, sessions=None):
+    def resolve(self, project, exclude_pid=None, sessions=None, exclude_thread=None):
         sessions = codex_sessions() if sessions is None else sessions
-        return [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and s.ready]
+        direct = [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and s.ready]
+        claims = thread_context_claims(project, sessions=sessions)
+        merged = {s.target: s for s in direct}
+        merged.update({s.target: s for s in claims})
+        return [s for thread, s in merged.items() if thread != exclude_thread]
 
     def waiting(self, project, exclude_pid=None, sessions=None):
         """Screens in this project that are open but have no conversation of their own yet (mail for them is kept, not delivered)."""
         sessions = codex_sessions() if sessions is None else sessions
         return [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and not s.ready]
+
+    def unresolved(self, project, exclude_pid=None, sessions=None):
+        """Open sibling screens that prevent an unnamed project-wide route from being exact."""
+        sessions = codex_sessions() if sessions is None else sessions
+        return self.waiting(project, exclude_pid, sessions)
 
     def busy_note(self, session, now=None):
         """Sentence for the sender when this Codex screen is mid-task (it reads the message only afterwards), else ''.

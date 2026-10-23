@@ -381,8 +381,11 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
     project = lib.canon_project(project)   # aliases.json: project-g and project-g-full are one project, whichever name the sender typed
     hdr = m.headers or {}
     from_addr = lib.clean_address(hdr.get("From", "unknown"))
+    remote_sender = len(from_addr.split("@")) == 3
     pid_text = str(hdr.get("From-Pid", ""))
     from_pid = int(pid_text) if re.fullmatch(r"[0-9]{1,9}", pid_text) else None   # isdigit() also accepts characters int() rejects
+    thread_text = str(hdr.get("From-Thread", ""))
+    from_thread = thread_text if not remote_sender and lib.UUID_RE.fullmatch(thread_text) else None
     inbox = hdr.get("Reply-Inbox")
     bad_inbox = bool(inbox) and not lib.INBOX_RE.match(str(inbox))
     if bad_inbox:
@@ -482,10 +485,22 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
         facts.update(tel.text_facts(text), bytes=len(text.encode("utf-8", "replace")))
 
     t_resolve = time.monotonic()
-    targets = await asyncio.to_thread(door.resolve, project, from_pid)
+    if agent == "codex" and from_thread:
+        targets = await asyncio.to_thread(door.resolve, project, from_pid, None, from_thread)
+    else:
+        targets = await asyncio.to_thread(door.resolve, project, from_pid)
     facts["resolve_ms"] = tel.elapsed_ms(t_resolve)
     per_session = getattr(door, "per_session", False)
     route = None
+    unresolved = await asyncio.to_thread(door.unresolved, project, from_pid) if agent == "codex" and hasattr(door, "unresolved") and not want else []
+    if unresolved and targets:
+        if first_try:
+            log("claim_not_ready", frm=from_addr, to=to, pids=[w.pid for w in unresolved])
+            facts["reply"] = await reply(nc, inbox, "queued", f"an unresolved Codex sibling screen is open in {project}; kept for {lib.ago(lib.MAX_AGE_S)} until its exact conversation is known",
+                                         reason="claim_not_ready")
+        await m.nak(delay=10)
+        decide(m, "queued", "claim_not_ready", t_start, facts, first_try, targets_n=0, waiting_pids=[w.pid for w in unresolved])
+        return
     if not targets and pick_id:
         await refuse("pick_nobody", f"no {agent} session is open in {project} right now, so held message {held['id']} stays held: try `post pick` again when one is", "refused_pick")
         return
