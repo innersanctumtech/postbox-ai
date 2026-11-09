@@ -329,6 +329,12 @@ async def store_for_forwarding(machine, to_project, to_agent, text, me, why):
     sys.exit(3)
 
 
+def send_result_text(status, detail, to_machine, message_id):
+    """Format the sender-visible outcome with the opaque ID used by `post status`."""
+    result = f"{status}: {detail}{' [on ' + to_machine + ']' if to_machine and status != 'held' else ''}"
+    return f"{result} (message id {message_id})"
+
+
 async def send(to_agent, to_project, to_machine, text, me):
     from nats.errors import TimeoutError as NatsTimeout
 
@@ -383,7 +389,7 @@ async def send(to_agent, to_project, to_machine, text, me):
     labels = [str(t) for t in (outcome.get("targets") or [])]
     note(result=status, reason=reason, targets_n=len(labels), target_pids=[int(n) for n in re.findall(r"\(pid (\d+)\)", " ".join(labels))],
          busy=[kind for needle, kind in (("is mid-task", "mid_task"), ("cannot be woken", "cannot_wake")) if needle in str(detail)])
-    print(f"{status}: {detail}{' [on ' + to_machine + ']' if remote and status != 'held' else ''}")   # a held answer's commands already carry the machine
+    print(send_result_text(status, detail, to_machine if remote else None, headers["Nats-Msg-Id"]))
     sys.exit({"delivered": 0, "queued": 3, "refused": 4, "held": 5}.get(status, 2))
 
 

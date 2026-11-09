@@ -16,6 +16,10 @@ from postbox import post  # noqa: E402
 
 class DeliveryStatusCliTests(unittest.TestCase):
     def test_status_reads_synthetic_correlation_and_seen_records(self):
+        message_id = "message-a"
+        send_line = post.send_result_text("delivered", "accepted", None, message_id)
+        self.assertIn(f"message id {message_id}", send_line)
+
         with tempfile.TemporaryDirectory() as directory:
             event_path = Path(directory) / "events.jsonl"
             records = [
@@ -27,14 +31,14 @@ class DeliveryStatusCliTests(unittest.TestCase):
                     patch.object(post.lib, "resolve_sender", side_effect=AssertionError("sender lookup should not run")):
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
-                    post.main(["post", "status", "message-a"])
+                    post.main(["post", "status", message_id])
                 self.assertIn("HANDOFF:", output.getvalue())
 
                 records.append({"event": "recipient_seen", "id": "receipt-b"})
                 event_path.write_text("".join(json.dumps(row) + "\n" for row in records))
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
-                    post.main(["post", "status", "message-a"])
+                    post.main(["post", "status", message_id])
                 self.assertIn("APPEARED:", output.getvalue())
                 self.assertIn("acknowledgement", output.getvalue())
 
