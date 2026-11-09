@@ -69,3 +69,26 @@ def read_process_identity(pid, *, platform=sys.platform, lib=None):
         return ProcessIdentity(before[0], before[1], path, before[2], before[3])
     except Exception as exc:
         raise ValueError("process identity unavailable") from exc
+
+
+def read_process_cwd(pid, *, platform=sys.platform, lib=None):
+    """Read the current directory from the kernel, or raise when unavailable."""
+    if platform != "darwin" or type(pid) is not int or not 1 < pid <= 2**31 - 1:
+        raise ValueError("unsupported platform or PID")
+    try:
+        if lib is None:
+            lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+            lib.proc_pidinfo.restype = ctypes.c_int
+        buf = ctypes.create_string_buffer(2352)
+        if lib.proc_pidinfo(pid, 9, 0, buf, len(buf)) != len(buf):
+            raise ValueError("incomplete process folder record")
+        raw = buf.raw[152:152 + 1024]
+        if b"\0" not in raw:
+            raise ValueError("invalid process folder record")
+        path = raw.split(b"\0", 1)[0].decode("utf-8", "strict")
+        if not os.path.isabs(path):
+            raise ValueError("invalid process folder")
+        return path
+    except Exception as exc:
+        raise ValueError("process folder unavailable") from exc

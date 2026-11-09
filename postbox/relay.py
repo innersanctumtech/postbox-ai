@@ -56,6 +56,14 @@ FORWARD_CONNECT_S = 3           # how long one try to open the other Mac's mailb
 FORWARD_REPLY_S = 8             # how long to wait for the other Mac's relay to answer a forwarded message
 FORWARD_LIMIT_REASONS = ("pair_limit", "recipient_limit")   # the other Mac refused for a stop rule: that clears with time, so the mail is kept and tried again
 STUCK_AFTER_S = int(os.environ.get("POSTBOX_STUCK_AFTER_S", "600"))
+FETCH_BATCH = 20
+FETCH_TIMEOUT_S = 25.0
+MAINTENANCE_SLOW_S = float(os.environ.get("POSTBOX_MAINTENANCE_SLOW_S", "10"))
+MAINTENANCE_STALL_S = float(os.environ.get("POSTBOX_MAINTENANCE_STALL_S", "300"))
+MAINTENANCE_DRAIN_S = 10.0
+MAINTENANCE_ALARM_KEY = "postbox-maintenance-stalled"
+MAINTENANCE = {"task": None, "kind": "", "started": 0.0, "alarmed": False}
+_ALARM_TASKS = set()
 # Optional portable notification hook.  It receives one JSON object on stdin;
 # no mail text, paths, command-line data, or inherited environment is exposed.
 STUCK_NOTIFY_CMD = shlex.split(os.environ.get("POSTBOX_STUCK_NOTIFY_CMD", ""))
@@ -196,6 +204,111 @@ async def check_stuck_holds(now=None):
     return due
 
 
+def maintenance_running():
+    task = MAINTENANCE["task"]
+    return task is not None and not task.done()
+
+
+def start_maintenance(kind, coro):
+    """Schedule at most one background maintenance pass beside the message loop."""
+    if maintenance_running():
+        coro.close()
+        return False
+
+    async def run():
+        began = time.monotonic()
+        try:
+            await coro
+        except Exception as exc:  # noqa: BLE001 - maintenance must never stop delivery
+            log("relay_error", error=f"{kind} maintenance failed: {type(exc).__name__}")
+        finally:
+            elapsed = time.monotonic() - began
+            if elapsed >= MAINTENANCE_SLOW_S:
+                log("maintenance_slow", kind=kind, took_s=round(elapsed, 1))
+
+    MAINTENANCE.update(task=asyncio.create_task(run()), kind=str(kind), started=time.monotonic())
+    return True
+
+
+def _background(callable_, *args):
+    async def run():
+        try:
+            await asyncio.to_thread(callable_, *args)
+        except Exception as exc:  # noqa: BLE001 - optional alarm failures do not affect delivery
+            log("relay_error", error=f"{getattr(callable_, '__name__', 'alarm')} failed: {type(exc).__name__}")
+
+    task = asyncio.create_task(run())
+    _ALARM_TASKS.add(task)
+    task.add_done_callback(_ALARM_TASKS.discard)
+
+
+def _maintenance_alarm(title, detail):
+    if ALARM_CMD and os.path.exists(ALARM_CMD):
+        subprocess.run(["bash", ALARM_CMD, MAINTENANCE_ALARM_KEY, title, detail, "Basso", "3600"],
+                       capture_output=True, timeout=30, check=True)
+
+
+def _clear_maintenance_alarm():
+    if ALARM_CMD and os.path.exists(ALARM_CMD):
+        subprocess.run(["bash", ALARM_CMD, "--resolve", MAINTENANCE_ALARM_KEY],
+                       capture_output=True, timeout=30, check=False)
+
+
+def check_maintenance_stall(now=None):
+    now = time.monotonic() if now is None else now
+    if maintenance_running():
+        elapsed = now - MAINTENANCE["started"]
+        if elapsed < MAINTENANCE_STALL_S or MAINTENANCE["alarmed"]:
+            return ""
+        MAINTENANCE["alarmed"] = True
+        kind = MAINTENANCE["kind"]
+        log("maintenance_stalled", kind=kind, running_s=int(elapsed))
+        tel.emit("post_maintenance_stalled", "relay", status="error", kind=kind, running_s=int(elapsed))
+        _background(_maintenance_alarm, "Post box delivery checks are stalled",
+                    f"The {kind} maintenance pass has run for {int(elapsed // 60)} minutes; delivery continues, but checks await its completion.")
+        return "stalled"
+    if MAINTENANCE["alarmed"]:
+        MAINTENANCE["alarmed"] = False
+        log("maintenance_recovered")
+        _background(_clear_maintenance_alarm)
+        return "cleared"
+    return ""
+
+
+async def drain_maintenance(timeout=MAINTENANCE_DRAIN_S):
+    task = MAINTENANCE["task"]
+    if task is not None and not task.done():
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def quiet_round(nc, js, quiet_rounds):
+    log("idle_quiet_start", round=quiet_rounds)
+    await check_codex_seen(nc)
+    log("idle_quiet_codex_done")
+    await check_stuck_holds()
+    if quiet_rounds % 12 == 0:
+        log("heartbeat")
+        for action, event in ((lib.inbox_sweep, "inbox_expired"), (lib.reg_sweep, "registrations_swept"), (lib.hold_sweep, "holds_expired")):
+            try:
+                count = await asyncio.to_thread(action)
+                if count:
+                    log(event, count=count, messages=count, files=count)
+            except Exception as exc:  # noqa: BLE001
+                log("relay_error", error=f"{event} failed: {type(exc).__name__}")
+        sweep_expired_queue()
+        sweep_expired_forwards()
+    await maybe_summary(js)
+    log("idle_quiet_end", round=quiet_rounds)
+
+
+def is_fetch_timeout(error):
+    """Both the NATS deadline and Python's deadline mean the pull returned no messages."""
+    return isinstance(error, (NatsTimeout, asyncio.TimeoutError))
+
+
 def decide(m, result, reason, started, facts, first_try, **extra):
     """Count one relay decision and write its post_deliver event. Mail that keeps waiting is retried every 10 seconds; those
     retries are only counted (retry_naks). Written: the first decision on a message, every refusal, and the final delivery."""
@@ -229,6 +342,12 @@ def decide(m, result, reason, started, facts, first_try, **extra):
                  limit=tel.limit_of(reason), **facts, **extra)
     except Exception:  # noqa: BLE001 - telemetry never changes what the relay does with mail
         pass
+
+
+async def ack_delivery(m, message_id, frm, to, targets):
+    """Write the handoff correlation before settling its broker record."""
+    log("delivery_correlation", id=str(message_id), frm=frm, to=to, targets=list(targets))
+    await m.ack()
 
 
 def sweep_expired_queue(now=None):
@@ -657,8 +776,8 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
     if route:
         shown["route"] = route
     if delivered:
-        await m.ack()
         log("delivered", frm=from_addr, to=to, targets=delivered, failed=failed, bytes=len(text), busy=notes, route=route)
+        await ack_delivery(m, watch_id, from_addr, to, delivered)
         detail = "delivered to " + ", ".join(delivered)
         if pick_id:
             await asyncio.to_thread(lib.hold_delete, pick_id)
@@ -730,6 +849,7 @@ async def check_codex_seen(nc, doors=None):
     except Exception as e:  # noqa: BLE001
         log("relay_error", error="codex seen check failed: " + repr(e)[:120])
         return []
+    discovery = None
     for e, result in settled:
         waited = int(time.time() - float(e.get("sent", time.time())))
         if result in ("retry", "recover"):
@@ -737,7 +857,17 @@ async def check_codex_seen(nc, doors=None):
             body, project = e.get("body"), e.get("project")
             replacement = None
             try:
-                snapshot = await asyncio.to_thread(door.candidates, project) if isinstance(door, lib.CodexDoor) and project else None
+                if isinstance(door, lib.CodexDoor) and project:
+                    if discovery is None:
+                        discovery = await asyncio.to_thread(lib.codex_discovery_snapshot)
+                    screens, screen_ids = discovery
+                    if type(door).candidates is lib.CodexDoor.candidates:
+                        snapshot = await asyncio.to_thread(door.candidates, project, sessions=screens,
+                                                           screen_snapshot=screen_ids)
+                    else:
+                        snapshot = await asyncio.to_thread(door.candidates, project)
+                else:
+                    snapshot = None
                 ready = snapshot.ready if snapshot else []
                 replacement = next((s for s in ready if s.target == e.get("thread")), None)
                 # A departed conversation may be replaced exactly once and only
@@ -976,58 +1106,34 @@ async def main():
                      uptime_s=int(time.time() - STATS.started), summary_every_s=SUMMARY_EVERY_S)
             ready_before = True
             while True:
-                log("idle_wait")   # the loop is about to wait on NATS; if the next line never comes, fetch is the stall
+                log("idle_wait")
                 msgs = []
                 try:
-                    # A failed old message is NAKed below; fetch a bounded batch so it
-                    # cannot starve later mail that is already waiting in the stream.
-                    msgs = await psub.fetch(20, timeout=25)
+                    msgs = await psub.fetch(FETCH_BATCH, timeout=FETCH_TIMEOUT_S)
                     log("idle_wake", msgs=len(msgs))
-                except NatsTimeout:
-                    pass
-                # A message that keeps waiting is redelivered every 10 s, so fetch never times out and the quiet work below
-                # never ran (the heartbeat and Codex checks stopped for hours). Run it on a timer too.
-                if not msgs or time.monotonic() - last_quiet >= QUIET_EVERY_S:
-                    last_quiet = time.monotonic()
+                except Exception as exc:  # noqa: BLE001 - both supported timeout forms mean no work arrived
+                    if not is_fetch_timeout(exc):
+                        raise
+                    log("idle_wake", msgs=0)
+                now = time.monotonic()
+                if not msgs or now - last_quiet >= QUIET_EVERY_S:
+                    last_quiet = now
                     quiet_rounds += 1
-                    log("idle_quiet_start", round=quiet_rounds)   # quiet branch: the codex check runs next
-                    await check_codex_seen(nc)
-                    log("idle_quiet_codex_done")
-                    await check_stuck_holds()
-                    if quiet_rounds % 12 == 0:
-                        log("heartbeat")
-                        try:   # unread inbox mail expires like queued mail (lib.MAX_AGE_S); a failed sweep must never stop the relay
-                            expired = await asyncio.to_thread(lib.inbox_sweep)
-                            if expired:
-                                log("inbox_expired", messages=expired)
-                        except Exception as e:  # noqa: BLE001
-                            log("relay_error", error="inbox sweep failed: " + repr(e)[:120])
-                        try:   # a declaration (post join) whose session is gone or whose process number was reused; same never-fail pattern
-                            swept = await asyncio.to_thread(lib.reg_sweep)
-                            if swept:
-                                log("registrations_swept", files=swept)
-                        except Exception as e:  # noqa: BLE001
-                            log("relay_error", error="registration sweep failed: " + repr(e)[:120])
-                        try:   # a held message (it did not say which session) expires after the same 7 days as queued mail
-                            dropped = await asyncio.to_thread(lib.hold_sweep)
-                            if dropped:
-                                log("holds_expired", messages=dropped)
-                        except Exception as e:  # noqa: BLE001
-                            log("relay_error", error="hold sweep failed: " + repr(e)[:120])
-                        sweep_expired_queue()
-                        sweep_expired_forwards()
-                        if forwarder.done():   # the forwarder must not die quietly: say so, and let the reconnect below start a new one
-                            raise RuntimeError("the forwarder stopped: " + repr(forwarder.exception() if not forwarder.cancelled() else "cancelled")[:120])
-                    await maybe_summary(js)
-                    log("idle_quiet_end", round=quiet_rounds)
+                    start_maintenance("quiet", quiet_round(nc, js, quiet_rounds))
+                elif not maintenance_running():
+                    start_maintenance("watch", check_codex_seen(nc))
+                check_maintenance_stall()
+                if quiet_rounds and quiet_rounds % 12 == 0 and forwarder.done():
+                    raise RuntimeError("the forwarder stopped: " + repr(forwarder.exception() if not forwarder.cancelled() else "cancelled")[:120])
                 await handle_batch(nc, msgs)
-                await maybe_summary(js)
         except Exception as e:  # noqa: BLE001
             log("relay_error", error=repr(e))
             await asyncio.sleep(3)
         finally:
             if forwarder is not None:
                 forwarder.cancel()
+                await asyncio.gather(forwarder, return_exceptions=True)
+            await drain_maintenance()
             if nc is not None:   # never leave the old connection behind when the loop reconnects (it kept answering who, twice)
                 try:
                     await nc.close()

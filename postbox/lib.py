@@ -11,6 +11,7 @@ import re
 import socket
 import stat
 import subprocess
+import sys
 import time
 import uuid
 from collections import defaultdict, deque
@@ -398,7 +399,62 @@ def _run(cmd, timeout=5) -> str:
         return ""
 
 
+def _process_identity_module():
+    try:
+        from . import macos_process_identity
+    except ImportError:
+        import macos_process_identity
+    return macos_process_identity
+
+
+def _native_process_token(pid):
+    try:
+        identity = _process_identity_module().read_process_identity(pid)
+        return (identity.start_sec, identity.start_usec)
+    except (ValueError, OSError):
+        return None
+
+
+class ProcessTable(dict):
+    """One process listing with the kernel identities captured around that listing."""
+    identity = None
+    captured_at = None
+    listed_at = None
+
+
+def _native_starts_all():
+    """Capture process start tokens before the single process listing, when Darwin libproc is available."""
+    if sys.platform != "darwin":
+        return {}
+    try:
+        import ctypes
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        libproc.proc_listallpids.restype = ctypes.c_int
+        buffer = (ctypes.c_int * 65536)()
+        count = libproc.proc_listallpids(buffer, ctypes.sizeof(buffer))
+        if count <= 0:
+            return {}
+        reader = _process_identity_module().read_process_identity
+        starts = {}
+        for pid in buffer[:min(count, len(buffer))]:
+            try:
+                identity = reader(int(pid))
+                starts[int(pid)] = (identity.start_sec, identity.start_usec)
+            except (ValueError, OSError):
+                continue
+        return starts
+    except Exception:
+        return {}
+
+
 def cwd_of(pid):
+    try:
+        native = _process_identity_module().read_process_cwd(pid)
+        if native:
+            return native
+    except (ValueError, OSError):
+        pass
     for line in _run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]).splitlines():
         if line.startswith("n"):
             return line[1:]
@@ -450,7 +506,11 @@ def reg_dir() -> Path:
 def process_start(pid) -> Optional[str]:
     """When the process started, as `ps` prints it (`Fri Oct  2 14:55:19 2026`, whitespace squeezed), else None. A reused process number
     starts at a different time, so a registration made for the old process never matches the new one."""
-    return " ".join(_run(["ps", "-p", str(pid), "-o", "lstart="]).split()) or None
+    try:
+        identity = _process_identity_module().read_process_identity(pid)
+        return f"{identity.start_sec}.{identity.start_usec:06d}"
+    except (ValueError, OSError):
+        return " ".join(_run(["ps", "-p", str(pid), "-o", "lstart="]).split()) or None
 
 
 def _reg_path(pid) -> Path:
@@ -1165,10 +1225,20 @@ def codex_context_screen_snapshot(table=None):
     for pid, (_parent, argv) in sorted(table.items()):
         args = _codex_wrapper_args(argv)
         if args is not None and codex_screen_args(args)[0]:
+            listed = getattr(table, "identity", None)
+            token = _native_process_token(pid) if listed is not None else None
+            if listed is not None and (listed.get(pid) is None or token != listed.get(pid)):
+                continue
             started = process_start(pid)
             if started:
                 out.append({"pid": pid, "start": started})
     return out
+
+
+def codex_discovery_snapshot():
+    """Return screens and their claim-validation identity from one bounded process listing."""
+    table = process_table()
+    return codex_sessions(table), codex_context_screen_snapshot(table)
 
 
 def _codex_claim_dir() -> Path:
@@ -1403,6 +1473,11 @@ def codex_thread_updated(thread_id):
 
 def process_age_s(pid):
     """Seconds since the process started (ps etime: [[dd-]hh:]mm:ss, no locale in it), else None."""
+    try:
+        identity = _process_identity_module().read_process_identity(pid)
+        return max(0, int(time.time() - (identity.start_sec + identity.start_usec / 1_000_000)))
+    except (ValueError, OSError):
+        pass
     text = _run(["ps", "-p", str(pid), "-o", "etime="]).strip()
     m = re.fullmatch(r"(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)", text)
     if not m:
@@ -1532,8 +1607,12 @@ def native_sender_identity(thread_id):
 def process_table():
     """{pid: (ppid, argv)} for every process, from ps."""
     import shlex
-    table = {}
-    for line in _run(["ps", "-axo", "pid=,ppid=,command="], timeout=8).splitlines():
+    table = ProcessTable()
+    table.captured_at = time.time()
+    table.identity = _native_starts_all() or None
+    listing = _run(["ps", "-axo", "pid=,ppid=,command="], timeout=8)
+    table.listed_at = time.time()
+    for line in listing.splitlines():
         parts = line.strip().split(None, 2)
         if len(parts) < 3 or not parts[0].isdigit():
             continue
@@ -1566,7 +1645,14 @@ def codex_sessions(table=None):
             continue
         interactive, thread = codex_screen_args(args)
         if interactive:
-            screens.append((pid, thread, cwd_of(pid)))
+            listed = getattr(table, "identity", None)
+            before = _native_process_token(pid) if listed is not None else None
+            if listed is not None and (listed.get(pid) is None or before != listed.get(pid)):
+                continue
+            cwd = cwd_of(pid)
+            if listed is not None and _native_process_token(pid) != before:
+                cwd = None
+            screens.append((pid, thread, cwd))
     claimed = {t for _p, t, _c in screens if t}
     threads = codex_user_thread_snapshot()
     now = time.time()
@@ -1771,7 +1857,7 @@ class CodexDoor:
     def sessions(self):
         return codex_sessions()
 
-    def candidates(self, project, exclude_pid=None):
+    def candidates(self, project, exclude_pid=None, *, sessions=None, screen_snapshot=None):
         """Discover once, then project ready and waiting screens from that same snapshot."""
         # Older synthetic doors provide their own projections instead of a sessions()
         # source.  Keep that seam: their projection is already their snapshot.
@@ -1783,9 +1869,17 @@ class CodexDoor:
                 ready=self.resolve(project, exclude_pid),
                 waiting=self.waiting(project, exclude_pid),
             )
-        sessions = self.sessions()
+        if sessions is not None:
+            sessions = sessions
+            screen_snapshot = [] if screen_snapshot is None else screen_snapshot
+        elif "sessions" in self.__dict__ or type(self).sessions is not CodexDoor.sessions:
+            sessions, screen_snapshot = self.sessions(), []
+        else:
+            table = process_table()
+            sessions = codex_sessions(table)
+            screen_snapshot = codex_context_screen_snapshot(table)
         direct = [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and s.ready]
-        claims = thread_context_claims(project, sessions=sessions)
+        claims = thread_context_claims(project, sessions=sessions, snapshot=screen_snapshot)
         merged = {s.target: s for s in direct}
         merged.update({s.target: s for s in claims})
         claimed_pids = {s.pid for s in claims}
@@ -1797,9 +1891,18 @@ class CodexDoor:
         )
 
     def resolve(self, project, exclude_pid=None, sessions=None, exclude_thread=None):
-        sessions = self.sessions() if sessions is None else sessions
+        if sessions is None and ("sessions" in self.__dict__ or type(self).sessions is not CodexDoor.sessions):
+            sessions, snapshot = self.sessions(), []
+        elif sessions is None:
+            table = process_table()
+            sessions = codex_sessions(table)
+            snapshot = codex_context_screen_snapshot(table)
+        else:
+            # A supplied synthetic or already-discovered session set must not
+            # trigger another native process scan while validating claims.
+            snapshot = []
         direct = [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and s.ready]
-        claims = thread_context_claims(project, sessions=sessions)
+        claims = thread_context_claims(project, sessions=sessions, snapshot=snapshot)
         merged = {s.target: s for s in direct}
         merged.update({s.target: s for s in claims})
         return [s for thread, s in merged.items() if thread != exclude_thread]
