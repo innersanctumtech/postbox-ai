@@ -1,6 +1,6 @@
 """Which delivery doors the post box has switched on.
 
-A "door" is the way the relay hands a message to one kind of agent (Claude Code, OpenAI Codex, Grok CLI, Grok Bot desktop).
+A "door" is the way the relay hands a message to one kind of agent (Claude Code, Codex CLI, Grok CLI, Grok Bot desktop).
 Only the doors listed in ENABLED_DOORS are active. The code for every door stays in this repo and stays tested; the other
 doors are simply switched off.
 
@@ -19,7 +19,7 @@ import os
 
 ENABLED_DOORS = {
     "claude",
-    # "codex",            # OpenAI Codex CLI (needs `codex` on PATH)
+    # "codex",            # Codex CLI (needs `codex` on PATH)
     # "grok",             # xAI Grok CLI (inbox file, no wake)
     # "grokbot-desktop",  # Grok Bot desktop via webhook (needs wake.json)
 }
