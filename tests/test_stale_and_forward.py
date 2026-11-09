@@ -48,8 +48,12 @@ check("elapsed time reads plainly, days included", (lib.ago(5), lib.ago(240), li
 
 
 class Msg:
-    def __init__(self, subject, text, headers, delivered=1, stored_ago=None, seq=1):
+    next_stream = 1
+    def __init__(self, subject, text, headers, delivered=1, stored_ago=None, seq=None):
         self.subject, self.data, self.headers = subject, text.encode() if isinstance(text, str) else text, headers
+        if seq is None:
+            seq = Msg.next_stream
+            Msg.next_stream += 1
         md = types.SimpleNamespace(num_delivered=delivered, sequence=types.SimpleNamespace(stream=seq, consumer=seq))
         if stored_ago is not None:
             from datetime import datetime, timedelta, timezone

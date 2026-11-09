@@ -31,6 +31,7 @@ TMP = tempfile.mkdtemp(prefix="postbox-telemetry-test-")
 SPOOL = os.path.join(TMP, "spool")
 SUPPORT = os.path.join(TMP, "support")
 os.makedirs(SUPPORT)
+os.chmod(SUPPORT, 0o700)
 os.environ.update(POSTBOX_TELEMETRY_SPOOL=SPOOL, POSTBOX_SUPPORT_DIR=SUPPORT, POSTBOX_MACHINE="mac-a",
                   POSTBOX_INBOX_DIR=os.path.join(TMP, "inbox"))
 for name in ("POSTBOX_CALLER", "POSTBOX_AS"):
@@ -496,12 +497,14 @@ check("post inbox --watch writes ONE event when it starts (a stopped process can
 # telemetry must not change what the command does
 fresh()
 nc1 = CliNC({"status": "delivered", "detail": "delivered to claude@other (pid 1)", "targets": ["claude@other (pid 1)"]})
-with_tel = cli(["claude@other", "same words"], nc1)
-with mock.patch.dict(os.environ, {"POSTBOX_TELEMETRY": "0"}):
-    nc2 = CliNC({"status": "delivered", "detail": "delivered to claude@other (pid 1)", "targets": ["claude@other (pid 1)"]})
-    without_tel = cli(["claude@other", "same words"], nc2)
+fixed_publication_id = types.SimpleNamespace(hex="a" * 32)
+with mock.patch.object(post.uuid, "uuid4", return_value=fixed_publication_id):
+    with_tel = cli(["claude@other", "same words"], nc1)
+    with mock.patch.dict(os.environ, {"POSTBOX_TELEMETRY": "0"}):
+        nc2 = CliNC({"status": "delivered", "detail": "delivered to claude@other (pid 1)", "targets": ["claude@other (pid 1)"]})
+        without_tel = cli(["claude@other", "same words"], nc2)
 check("with telemetry off the command prints the same and exits the same", with_tel == without_tel)
-with mock.patch.object(post, "tel", lib._NoTelemetry()):
+with mock.patch.object(post.uuid, "uuid4", return_value=fixed_publication_id), mock.patch.object(post, "tel", lib._NoTelemetry()):
     nc3 = CliNC({"status": "delivered", "detail": "delivered to claude@other (pid 1)", "targets": ["claude@other (pid 1)"]})
     broken = cli(["claude@other", "same words"], nc3)
 check("even with the telemetry module missing the command works", broken == with_tel)
@@ -540,13 +543,16 @@ check("identity trace: --as", me == ("grok", "myproj", None) and lib.IDENTITY_TR
 # ================================================================= the relay
 print("-- relay")
 class Msg:
+    next_stream = 1
     def __init__(self, subject, text, headers, delivered=1, stored_ago=None, seq=None):
         self.subject, self.data, self.headers = subject, text.encode(), headers
         md = types.SimpleNamespace(num_delivered=delivered)
+        if seq is None:
+            seq = Msg.next_stream
+            Msg.next_stream += 1
         if stored_ago is not None:
             md.timestamp = datetime.now(timezone.utc) - timedelta(seconds=stored_ago)
-        if seq is not None:
-            md.sequence = types.SimpleNamespace(stream=seq, consumer=seq)
+        md.sequence = types.SimpleNamespace(stream=seq, consumer=seq)
         self.metadata = md
         self.acked = self.naked = self.termed = None
 
@@ -819,6 +825,7 @@ check("a failure inside telemetry cannot break the relay's own log line", True)
 fresh()
 shutil.rmtree(SUPPORT, ignore_errors=True)
 os.makedirs(SUPPORT)
+os.chmod(SUPPORT, 0o700)
 with mock.patch.object(telemetry, "spool_dir", lambda: None):
     handle(Msg("post.p.claude", SECRET, HDR), Door([T1]))
     cli(["claude@other", SECRET], CliNC({"status": "delivered", "detail": "x"}))

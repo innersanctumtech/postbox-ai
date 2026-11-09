@@ -63,8 +63,12 @@ def S(pid, name, project="project-a", sid=None, agent="claude"):
 
 
 class Msg:
-    def __init__(self, subject, text, headers, delivered=1, seq=1):
+    next_stream = 1
+    def __init__(self, subject, text, headers, delivered=1, seq=None):
         self.subject, self.data, self.headers = subject, text.encode(), headers
+        if seq is None:
+            seq = Msg.next_stream
+            Msg.next_stream += 1
         self.metadata = types.SimpleNamespace(num_delivered=delivered, sequence=types.SimpleNamespace(stream=seq, consumer=seq))
         self.acked = self.naked = self.termed = None
 

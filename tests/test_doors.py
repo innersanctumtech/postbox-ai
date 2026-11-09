@@ -224,6 +224,7 @@ else:
     support, socks, sessions = TMP / "support", TMP / "socks", TMP / "sessions"
     for d in (support, socks, sessions, TMP / "proj"):
         d.mkdir(parents=True)
+    support.chmod(0o700)
     (TMP / "n.conf").write_text(installer.nats_conf("postbox-doors-test", port, TMP / "store", None))
     nats = subprocess.Popen([NATS_BIN, "-c", str(TMP / "n.conf")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     procs.append(nats)

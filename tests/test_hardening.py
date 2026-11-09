@@ -95,9 +95,12 @@ print("relay decisions (fakes)")
 
 
 class FakeMsg:
+    next_stream = 1
     def __init__(self, subject, data, headers, delivered=1):
         self.subject, self.data, self.headers = subject, data if isinstance(data, bytes) else data.encode(), headers
-        self.metadata = types.SimpleNamespace(num_delivered=delivered)
+        stream = FakeMsg.next_stream
+        FakeMsg.next_stream += 1
+        self.metadata = types.SimpleNamespace(num_delivered=delivered, sequence=types.SimpleNamespace(stream=stream, consumer=stream))
         self.acked = self.naked = self.termed = None
 
     async def ack(self): self.acked = True
@@ -357,6 +360,7 @@ try:
     socks.mkdir()
     support = Path(TMP) / "support"
     support.mkdir()
+    support.chmod(0o700)
     (support / "machine.seed").write_text(lseed + "\n")
     (support / "link.json").write_text(json.dumps({"machine": "alpha", "peers": {}}))
     folder = Path(TMP) / "proj-z"
@@ -399,10 +403,14 @@ try:
     who_replies = asyncio.run(hostile())
     delivered = wait_for(lambda: frames.exists() and frames.read_text(errors="replace").count("hostile mail") == 3, 12)
     relay_log = log.read_text()
-    check("three hostile mails are all delivered (no stall, no retry loop)", delivered and time.time() - t0 < 20, frames.read_text(errors="replace")[-200:] if frames.exists() else "no frames")
+    delivery_detail = frames.read_text(errors="replace")[-200:] if frames.exists() else "no frames"
+    if not delivered:
+        # Keep this diagnostic synthetic and bounded: it contains only the local fixture's relay events.
+        delivery_detail += " relay=" + " | ".join(line[:240] for line in relay_log.splitlines()[-8:])
+    check("three hostile mails are all delivered (no stall, no retry loop)", delivered and time.time() - t0 < 20, delivery_detail)
     check("the relay logged each bad reply name and raised no error", relay_log.count("bad_reply_inbox") >= 2 and "handle_error" not in relay_log and "relay_error" not in relay_log, relay_log[-400:])
     check("one who request is answered exactly once (no leaked connections answering twice)", who_replies == 1, f"replies={who_replies}")
-    body = frames.read_text(errors="replace")
+    body = frames.read_text(errors="replace") if frames.exists() else ""
     check("a hostile sender name reaches the receiver only in address form", "post claude@my-project@mac-b" in body.replace('\\"', '"') or "post claude@evil@mac-b" in body.replace('\\"', '"'))
 
     # ---------------------------------------------------------------- oversize and the stream's own cap

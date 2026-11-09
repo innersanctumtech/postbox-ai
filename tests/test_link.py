@@ -662,6 +662,7 @@ def make_mac(name):
     mac = SimpleNamespace(name=name, dir=Path(TMP) / name, port=free_port())
     mac.support, mac.socks = mac.dir / "support", mac.dir / "socks"
     mac.support.mkdir(parents=True)
+    mac.support.chmod(0o700)
     mac.socks.mkdir()
     mac.pub = subprocess.run([PY, KEYTOOL, "ensure", str(mac.support / "machine.seed")], capture_output=True, text=True).stdout.strip()
     mac.env = dict(os.environ, POSTBOX_NATS_URL=f"nats://127.0.0.1:{mac.port}", POSTBOX_SUPPORT_DIR=str(mac.support), POSTBOX_CLAUDE_SOCK_DIR=str(mac.socks),
@@ -728,7 +729,9 @@ try:
     g_main = fake_claude(gamma, "proj-g")
 
     code, out, err, took = post(alpha, a_main, "claude@proj-b@beta", "hello beta, this is alpha")
-    check("alpha to beta: delivered, and the answer says which Mac it happened on", code == 0 and out.startswith("delivered:") and out.endswith("[on beta]"), f"{code} {out} {err}")
+    check("alpha to beta: delivered, names the Mac and prints its status lookup id",
+          code == 0 and re.fullmatch(r"delivered: .* \[on beta\] \(message id [0-9a-f]{32}\)", out) is not None,
+          f"{code} {out} {err}")
     got = wait_for(lambda: "hello beta, this is alpha" in frames(b_main))
     check("the session on beta really received the text, from the sender's full address", got and "Message from claude@proj-a@alpha (post box)" in frames(b_main), frames(b_main)[-300:])
 

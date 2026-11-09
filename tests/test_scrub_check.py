@@ -151,6 +151,11 @@ with tempfile.TemporaryDirectory() as tmp:
     tree(tmp, {**CLEAN, ".venv/lib/x.py": f"cd {HOME}\n", ".git/config": f"url = {HOME}\n", "img.png": b"\x89PNG\x00" + HOME.encode()})
     code, out = run(tmp)
     check(".venv, .git and binary files are not scanned", code == 0, out)
+with tempfile.TemporaryDirectory() as tmp:
+    tree(tmp, CLEAN)
+    Path(tmp, ".git").write_text("gitdir: /local/worktree/metadata\n")
+    code, out = run(tmp)
+    check("a linked-worktree gitdir pointer is not published content", code == 0, out)
 
 print("denylist")
 with tempfile.TemporaryDirectory() as tmp:

@@ -57,9 +57,12 @@ def cli(argv):
 
 
 class FakeMsg:
+    next_stream = 1
     def __init__(self, subject, data, headers, delivered=1):
         self.subject, self.data, self.headers = subject, data.encode(), headers
-        self.metadata = types.SimpleNamespace(num_delivered=delivered)
+        stream = FakeMsg.next_stream
+        FakeMsg.next_stream += 1
+        self.metadata = types.SimpleNamespace(num_delivered=delivered, sequence=types.SimpleNamespace(stream=stream, consumer=stream))
         self.acked = self.naked = self.termed = None
 
     async def ack(self):

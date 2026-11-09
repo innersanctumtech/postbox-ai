@@ -4,7 +4,7 @@
 The guard probes run in guarded child processes against a stand-in listener on a spare port. The parent process opens that listener, looks up this Mac's local addresses
 (a UDP connect to a documentation-range address, which sends nothing, and /sbin/ifconfig) and checks the suite inventory and the doc text.
 If the first child cannot establish the operating-system layer, this suite prints FAILED (not skipped) and exits 1, not 3 (the child is what exits 3).
-19 of the 21 suites import the guard directly; the other two are this one and tests/test_scrub_check.py, a static scanner.
+30 of the 36 suites import the guard directly. The six standalone suites cover this guard, the static scrub tool, or portable helpers without mailbox or process access.
 Run: python3 tests/test_env_guard.py   (from a normal Terminal on macOS, not from inside another sandbox)
 """
 import os
@@ -512,7 +512,8 @@ shutil.rmtree(WORK, ignore_errors=True)
 
 print("the suites that import the guard are the ones the docs say, and a new suite cannot skip it unnoticed")
 import ast   # noqa: E402
-NO_GUARD_IMPORT = {"test_env_guard.py", "test_scrub_check.py"}     # see README "Test guard", last bullet: this suite runs guarded children; the other is a static scanner
+NO_GUARD_IMPORT = {"test_env_guard.py", "test_scrub_check.py", "test_grok_door_port.py",
+                   "test_handoff_fence_portable.py", "test_post_delivery_status_cli.py", "test_scope_filter_public.py"}
 
 
 def imports_guard(path):
@@ -524,7 +525,7 @@ def imports_guard(path):
 SUITES = sorted(TESTS.glob("test_*.py"))
 guarded = [f.name for f in SUITES if imports_guard(f)]
 unguarded = [f.name for f in SUITES if not imports_guard(f)]
-check("every suite imports _env or _guard at module level, except the two named ones", set(unguarded) == NO_GUARD_IMPORT, str(unguarded))
+check("every mailbox or process suite imports _env or _guard; standalone helper suites are named", set(unguarded) == NO_GUARD_IMPORT, str(unguarded))
 COUNT_TEXT = f"{len(guarded)} of the {len(SUITES)} suites"
 for doc in ("README.md", "AGENTS.md", "CONTRIBUTING.md"):
     check(f"{doc} says {COUNT_TEXT} import the guard", COUNT_TEXT in (TESTS.parent / doc).read_text(), COUNT_TEXT)

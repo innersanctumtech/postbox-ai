@@ -38,6 +38,7 @@ GROK = os.path.join(TMP, "grok")
 SOCKS = os.path.join(TMP, "socks")
 for d in (HOME, SUPPORT, GROK, SOCKS):
     os.makedirs(d)
+os.chmod(SUPPORT, 0o700)
 BASE_ENV = {"HOME": HOME, "PATH": os.environ.get("PATH", ""), "POSTBOX_TELEMETRY": "0", "POSTBOX_REG_DIR": REG, "POSTBOX_SUPPORT_DIR": SUPPORT,
             "POSTBOX_MACHINE": "mac-a", "GROK_HOME": GROK}
 os.environ.update(BASE_ENV)

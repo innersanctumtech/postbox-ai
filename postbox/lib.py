@@ -86,6 +86,11 @@ def support_dir() -> Path:
     return Path(os.environ.get("POSTBOX_SUPPORT_DIR") or Path.home() / "Library" / "Application Support" / "postbox")
 
 
+def relay_log_path() -> Path:
+    """Return the local relay log location used by the installed service."""
+    return Path(os.environ.get("POSTBOX_RELAY_LOG") or Path.home() / "Library" / "Logs" / "postbox-relay.log")
+
+
 def _stuck_notice_file() -> Path:
     return Path(os.environ.get("POSTBOX_STUCK_NOTICES") or support_dir() / "stuck-notices.json")
 
@@ -708,7 +713,10 @@ def claude_session_record(pid):
         # the file's own times are UTC while `ps` prints local time, so compare as epoch seconds (a few minutes of slack)
         actual = process_start(pid)
         try:
-            actual_s = time.mktime(time.strptime(actual, "%a %b %d %H:%M:%S %Y")) if actual else None
+            if actual and re.fullmatch(r"\d+\.\d{6}", actual):
+                actual_s = float(actual)
+            else:
+                actual_s = time.mktime(time.strptime(actual, "%a %b %d %H:%M:%S %Y")) if actual else None
         except ValueError:
             actual_s = None
         if actual_s is not None and abs(actual_s - began / 1000) > 300:
@@ -2165,6 +2173,23 @@ class GrokDoor(_GrokInboxDoor):
         super().__init__(sessions_provider=lambda: grok_sessions(), same_project=same_project,
                          inbox_writer=lambda agent, project, text: inbox_put(agent, project, text),
                          renderer=lambda *args, **kwargs: render(*args, **kwargs))
+
+    def resolve(self, project, exclude_pid=None, sessions=None):
+        # Retain the public lib.GrokDoor seam used by callers that provide a
+        # synthetic session list without invoking this adapter's constructor.
+        provider = getattr(self, "_sessions_provider", grok_sessions)
+        matcher = getattr(self, "_same_project", same_project)
+        sessions = provider() if sessions is None else sessions
+        return [session for session in sessions
+                if matcher(session.project, project) and session.pid != exclude_pid][:1]
+
+    def render(self, from_addr, text, waited_s=None):
+        renderer = getattr(self, "_renderer", render)
+        return renderer(from_addr, text, inbox=True, waited_s=waited_s)
+
+    def deliver(self, session, text, timeout=None):
+        writer = getattr(self, "_inbox_writer", lambda agent, project, body: inbox_put(agent, project, body))
+        writer(self.agent, session.project, text)
 
 
 class InboxSession(Session):

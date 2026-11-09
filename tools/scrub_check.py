@@ -103,6 +103,8 @@ def walk(root):
     for folder, dirs, files in os.walk(root):
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
         for name in sorted(files):
+            if name == ".git":
+                continue  # Linked worktrees store only a local gitdir pointer here; it is not published source.
             yield Path(folder, name)
 
 

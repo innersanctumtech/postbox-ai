@@ -93,6 +93,7 @@ def make_mac(name):
     mac.support, mac.socks, mac.sessions = mac.dir / "support", mac.dir / "socks", mac.dir / "sessions"
     for d in (mac.support, mac.socks, mac.sessions):
         d.mkdir(parents=True)
+    mac.support.chmod(0o700)
     mac.pub = subprocess.run([PY, KEYTOOL, "ensure", str(mac.support / "machine.seed")], capture_output=True, text=True).stdout.strip()
     mac.env = dict(os.environ, POSTBOX_NATS_URL=f"nats://127.0.0.1:{mac.port}", POSTBOX_SUPPORT_DIR=str(mac.support), POSTBOX_CLAUDE_SOCK_DIR=str(mac.socks),
                    POSTBOX_CLAUDE_SESSIONS_DIR=str(mac.sessions), POSTBOX_FORWARD_RETRY_S="2")

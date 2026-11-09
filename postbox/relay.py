@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,7 @@ from nats.js.errors import NotFoundError  # noqa: E402
 
 import lib  # noqa: E402
 import wake  # noqa: E402
+import handoff_fence  # noqa: E402
 
 LIMITER = lib.PairLimiter()
 RECIPIENT_LIMITER = lib.PairLimiter(limit=lib.RECIPIENT_LIMIT)
@@ -64,6 +66,7 @@ MAINTENANCE_DRAIN_S = 10.0
 MAINTENANCE_ALARM_KEY = "postbox-maintenance-stalled"
 MAINTENANCE = {"task": None, "kind": "", "started": 0.0, "alarmed": False}
 _ALARM_TASKS = set()
+_HANDOFF_FENCE = None
 # Optional portable notification hook.  It receives one JSON object on stdin;
 # no mail text, paths, command-line data, or inherited environment is exposed.
 STUCK_NOTIFY_CMD = shlex.split(os.environ.get("POSTBOX_STUCK_NOTIFY_CMD", ""))
@@ -346,8 +349,46 @@ def decide(m, result, reason, started, facts, first_try, **extra):
 
 async def ack_delivery(m, message_id, frm, to, targets):
     """Write the handoff correlation before settling its broker record."""
-    log("delivery_correlation", id=str(message_id), frm=frm, to=to, targets=list(targets))
+    delivery_ids = [delivery_correlation_id(message_id, target) for target in targets]
+    log("delivery_correlation", message_id=str(message_id), delivery_ids=delivery_ids, frm=frm, to=to)
     await m.ack()
+
+
+def delivery_correlation_id(message_id, target):
+    """Stable opaque identifier for one message-to-target handoff."""
+    value = f"{message_id}\0{target}".encode("utf-8", "replace")
+    return hashlib.sha256(value).hexdigest()[:32]
+
+
+def _handoff_fence():
+    global _HANDOFF_FENCE
+    if _HANDOFF_FENCE is not None:
+        return _HANDOFF_FENCE
+    path = lib.support_dir() / "handoff-fence.sqlite"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        fence = handoff_fence.HandoffFence(path) if path.exists() else handoff_fence.HandoffFence.initialize(path)
+    except FileExistsError:
+        fence = handoff_fence.HandoffFence(path)
+    _HANDOFF_FENCE = fence
+    return fence
+
+
+async def fenced_deliver(m, door, target, body, message_id):
+    """Reserve one broker delivery before its side effect; never repeat uncertainty."""
+    _attempts, _age, sequence = msg_facts(m)
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+        raise handoff_fence.FenceError("broker sequence unavailable")
+    fence = await asyncio.to_thread(_handoff_fence)
+    stream = str(getattr(getattr(m, "metadata", None), "stream", None) or lib.STREAM)
+    state, token = await asyncio.to_thread(fence.reserve, stream, sequence, m.subject, str(message_id))
+    if state == "accepted":
+        return False
+    if state != "new" or not token:
+        raise handoff_fence.FenceError("previous handoff outcome is uncertain")
+    await asyncio.to_thread(door.deliver, target, body)
+    await asyncio.to_thread(fence.accept, stream, sequence, m.subject, str(message_id), token)
+    return True
 
 
 def sweep_expired_queue(now=None):
@@ -733,7 +774,7 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
     render = getattr(door, "render", None) or lib.render   # a door may word the reading instructions for its own agent (Grok, grokbot-desktop: their inbox)
     kw = {"project": project} if getattr(door, "render_with_project", False) else {}   # grokbot-desktop must state who it is, so its commands name the project
     body = render(from_label, text, waited_s=int(waited), **kw) if stale else render(from_label, text, **kw)
-    delivered, failed, notes, fail_classes = [], [], [], []
+    delivered, delivered_targets, failed, notes, fail_classes = [], [], [], [], []
     t_deliver = time.monotonic()
     watch_id = str(hdr.get("Nats-Msg-Id") or f"seq-{_seq}-{m.subject}")
     for t in targets:
@@ -753,14 +794,22 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
                 existing_watch = await asyncio.to_thread(lib.codex_watch_get, watch_id)
                 if existing_watch and existing_watch.get("state") == "queued":
                     delivered.append(t.label)
+                    delivered_targets.append(t.target)
                     continue
                 if existing_watch:
                     failed.append(f"{t.label}: delivery outcome pending")
                     fail_classes.append("PendingCodexDelivery")
                     continue
                 await asyncio.to_thread(lib.codex_watch_reserve, watch_id, t, body, from_addr, from_session)
-            await asyncio.to_thread(door.deliver, t, body)
+            if len(targets) == 1:
+                await fenced_deliver(m, door, t, body, watch_id)
+            else:
+                # Legacy/custom doors may intentionally fan one publication out
+                # to multiple recipients; the durable fence key is per broker
+                # publication, so it cannot reserve those independent effects.
+                await asyncio.to_thread(door.deliver, t, body)
             delivered.append(t.label)
+            delivered_targets.append(t.target)
             if agent == "codex" and isinstance(door, lib.CodexDoor):
                 try:
                     await asyncio.to_thread(lib.codex_watch_mark_queued, watch_id)
@@ -777,7 +826,7 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
         shown["route"] = route
     if delivered:
         log("delivered", frm=from_addr, to=to, targets=delivered, failed=failed, bytes=len(text), busy=notes, route=route)
-        await ack_delivery(m, watch_id, from_addr, to, delivered)
+        await ack_delivery(m, watch_id, from_addr, to, delivered_targets)
         detail = "delivered to " + ", ".join(delivered)
         if pick_id:
             await asyncio.to_thread(lib.hold_delete, pick_id)
@@ -889,6 +938,7 @@ async def check_codex_seen(nc, doors=None):
                 # rather than issuing a second queue call.
                 continue
         if result == "seen":
+            log("recipient_seen", id=delivery_correlation_id(e.get("id", ""), e.get("thread", "")))
             log("codex_seen", to=e.get("to"), frm=e.get("frm"), after_s=waited)
             tel.emit("post_codex_seen", "relay", status="ok", after_s=waited)
             continue
