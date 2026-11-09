@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "postbox"
-version = "0.1.0"
+version = "2.0.0"
 description = "A local mailbox that lets AI coding agent sessions message each other."
 readme = "README.md"
 license = { file = "LICENSE" }

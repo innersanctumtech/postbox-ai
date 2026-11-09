@@ -4,7 +4,11 @@
 
 You run Claude Code, Codex and Grok in separate windows, and you carry results between them by hand. The post box removes you from that loop. One AI session runs `post codex "review my change"`; the other session wakes up with that message in its conversation, does the work, and answers with the exact command that was attached to the message. It works between sessions in one project, between projects, between different AI tools, and between two linked Macs. Waiting costs nothing: no AI runs until a message arrives.
 
-**If you are an AI agent, read [AGENTS.md](AGENTS.md).** It has the install commands, the check, the status words and the troubleshooting table in the order you need them. Claude Code readers: [CLAUDE.md](CLAUDE.md) points there.
+**If you are an AI agent, read [AGENTS.md](AGENTS.md).** It has the install commands, the check, the status words and troubleshooting guidance in order. Claude Code readers: [CLAUDE.md](CLAUDE.md) points there.
+
+## Version 2.0.0
+
+Version 2.0.0 carries portable Postbox 0.3.1 functionality in the public project structure. It adds exact matching for multiple Codex screens, safer process identity and reuse checks, asynchronous relay maintenance, fairer message batches, and stronger delivery evidence and recovery. It also includes explicit post status, the Grok door, delivery confirmations and fences, and metadata diagnostics for stuck messages. See [the history](docs/HISTORY.md) and [Grok Desks](docs/GROK-DESKS.md) for details. These are release capabilities; this note does not claim a live installation or release readiness.
 
 What you get:
 
@@ -31,11 +35,11 @@ post (command)  ->  NATS JetStream (the mailbox)  ->  relay  ->  door  ->  the a
 
 1. finds or installs `nats-server` (`brew install nats-server`; or set `NATS_SERVER_BIN`),
 2. builds `.venv` and installs `nats-py` and `nkeys` from `requirements.txt`,
-3. generates this Mac's login key and writes `nats-server.conf` and the two launchd plists into the current user's `~/Library` folders,
-4. fills in paths at run time from the user's home folder, the repo folder and the host name; the data folder is `<repo>/jetstream` unless `POSTBOX_STORE_DIR` says otherwise,
+3. generates a local login key and writes NATS configuration and service definitions into the appropriate user locations,
+4. fills in local paths at run time; the mailbox data location can be configured,
 5. loads the services and proves the result with a real test message.
 
-The shipped files are checked by `tools/scrub_check.py` for machine-specific strings (home paths, private addresses, and your own denylist); the one thing the installer adds to the repo folder is the public key files under `peers/` when you link Macs (see "Link two Macs"). Moved the repo or changed the user? Run `python3 install.py` again; it rewrites the files and repairs the rest.
+The shipped files are checked by `tools/scrub_check.py` for machine-specific strings and private addresses. When linking Macs, public peer keys are stored locally. If the repository location changes, run `python3 install.py` again to refresh generated service configuration.
 
 ## Requirements
 
@@ -47,8 +51,8 @@ The shipped files are checked by `tools/scrub_check.py` for machine-specific str
 ## Install
 
 ```
-git clone https://github.com/innersanctumtech/postbox-ai.git ~/postbox
-cd ~/postbox
+git clone https://github.com/innersanctumtech/postbox-ai.git postbox
+cd postbox
 python3 install.py --dry-run     # prints the plan, changes nothing
 python3 install.py               # installs or repairs, then verifies (about a minute)
 python3 install.py --check       # verifies an existing install any time
@@ -59,7 +63,7 @@ python3 install.py --check       # verifies an existing install any time
 ```
 postbox-install: checking an existing install
 postbox-install:   ok   NATS answers on 127.0.0.1:4222
-postbox-install:   ok   relay is running and logging (~/Library/Logs/postbox-relay.log)
+postbox-install:   ok   relay is running and logging
 postbox-install:   ok   a real test message made the round trip (post to mailbox to relay and back)
 ```
 
@@ -67,10 +71,10 @@ The installer stops without changing anything if another post box is already ins
 
 Two things it prints but leaves to you:
 
-1. If `~/.local/bin` is not on your PATH: `export PATH="$HOME/.local/bin:$PATH"` (and put that line in `~/.zshrc`).
-2. Claude Code: add `"crossSessionInbound": "accept"` to `~/.claude/settings.json`. This is a Claude Code setting, not part of this repo, and nothing in this repo tests it. It is set on the Mac where the post box was built (Claude Code 2.1.294). Its documented purpose here: without it, a session in bypass mode may hold relay mail as "from an unidentified session". That effect is not verified by this repo. If mail never shows up in a session, read the relay log first (`~/Library/Logs/postbox-relay.log`: `delivered` means the relay handed the mail over), then check this setting.
+1. If the `post` command is not found, add its install directory to your shell's `PATH`.
+2. Claude Code may require a cross-session inbound setting to accept relay mail. Consult Claude Code's current documentation for the setting name and behavior.
 
-The installer also copies `claude-skill/post/SKILL.md` to `~/.claude/skills/post/SKILL.md` (if `~/.claude` exists), which teaches Claude Code sessions to use `post`.
+The installer can also install the Claude Code skill when Claude Code is present.
 
 `pip install .` installs only the `post` command (into the active environment). The mailbox and relay services come from `install.py`.
 
@@ -136,13 +140,13 @@ ENABLED_DOORS = {
 ```
 
 1. Remove the `# ` in front of a door.
-2. Run `python3 install.py` again. It reloads the relay with the new door set, installs that platform's skill (Codex: `codex-skill/post/SKILL.md` into `~/.codex/skills/post/`) and puts `codex` and `node` on the relay's PATH.
+2. Run `python3 install.py` again. It reloads the relay with the new door set and installs the corresponding platform skill when available.
 
 Mail for an agent whose door is off is refused with the reason `no_door`. The environment variable `POSTBOX_DOORS=claude,codex` replaces the file for a process started by hand (the tests use it); the launchd relay does not get it, so edit the file for the installed service.
 
-- **Codex** is found from its process list and its thread database (read-only). A Codex screen reads mail only between tasks, so a send can end with `Heads up: ... is mid-task`. Add the post rule to `~/.codex/AGENTS.md`: "To message another agent session, run the shell command `post <agent>[@project] "<message>"`. Typing it in chat sends nothing. After sending, end your turn: the reply arrives as a new message." The relay checks that each Codex delivery really reached the conversation and logs `codex_seen` or `codex_unseen`; set `POSTBOX_ALARM_CMD` to a script to be run on `codex_unseen`.
-- **Grok** (the xAI command line tool) is recognised from `~/.grok/active_sessions.json` and cannot be woken. Its mail waits in an inbox folder (50 messages, 7 days) and the session runs `post inbox` at the start of each turn. `post inbox --watch` prints one short line when mail arrives; `post inbox --history` shows what was read in the last 7 days.
-- **Grok Bot desktop** is a different app from the Grok command line tool. Its agent name is `grokbot-desktop`, it is known only by stating who it is (`post --as grokbot-desktop@project-a ...`), and it reads its inbox the same way. Optionally the relay rings a wake webhook after each delivery. Configure it in `wake.json` in the support folder (example: `examples/wake.json.example`). The file holds 1Password references like `op://<vault>/<item>/<field>`, never secrets; they are resolved at call time by `$POSTBOX_SECRET_CMD`, else `~/.claude/bin/op-cached` if it exists, else `op read`. `post wake-test grokbot-desktop@project-a` rings it once and stores nothing. A project with its own Desk entry (`grokbot-desktop@project-a`) gets its own webhook; mail sent to the general address from such a project is redirected to its Desk unless the sender is listed in `desk_sender_projects` or `"desk_redirect": false` is set.
+- **Codex** screens are matched to exact conversations using process and thread evidence. Multiple screens are supported; delivery is confirmed against the intended conversation, and unresolved delivery is reported explicitly. Codex reads mail between tasks.
+- **Grok** (the command line tool) uses a project inbox and cannot be woken. Mail waits in the inbox; run `post inbox` to read it. `post inbox --watch` checks for new mail, and `post inbox --history` shows recently read mail.
+- **Grok Bot desktop** is a separate app from Grok CLI. Its agent name is `grokbot-desktop`; identify it with `post --as grokbot-desktop@project-a ...`. It reads a project inbox. An optional wake webhook can notify it after delivery. See [Grok Desks](docs/GROK-DESKS.md) and `examples/wake.json.example` for configuration details. A project-specific Desk can receive mail addressed to the general Grok Bot identity when desk redirection is enabled.
 
 ## Link two Macs
 
@@ -153,7 +157,7 @@ Needs Tailscale signed in on both Macs and the post box installed on both. Every
 3. Back on `mac-a`: `python3 install.py --link --peer mac-b --peer-key mac-b=<the public key from step 2>`. Now both Macs trust each other.
 4. Check on `mac-a`: `python3 install.py --check` (it also tests each linked Mac), `post who mac-b`, `.venv/bin/python postbox/selfcheck.py --peer mac-b`. On `mac-b` give the OTHER Mac's name: `post who mac-a`, `.venv/bin/python postbox/selfcheck.py --peer mac-a`. A Mac is never its own peer: `--peer` with its own name fails (`install.py` says `--peer NAME is this Mac itself`; `post who` with its own name lists its own sessions instead).
 
-The installer saves keys as `peers/<machine>.pub` in the repo folder. Do not commit them to a public fork: give the other Mac the key with the command the installer prints. The option `--publish-key` runs `git add`, `commit` and `push` of that file for you; use it only when the repo's remote is private. The tailnet name of the other Mac is looked up in Tailscale at run time (`--peer NAME=HOST` or `POSTBOX_PEER_<NAME>=host[:port]` override). `--uninstall` removes the Tailscale forward it made and never touches one it did not make. A lost or replaced key: delete `machine.seed` in the support folder, run `install.py --link ...` again and re-run `--link` on the other Mac. This procedure is covered by `tests/test_link.py` with a stand-in for Tailscale and two emulated Macs; it needs a real tailnet for a real run.
+The installer stores public peer keys locally. Exchange only public keys with the other Mac; do not publish them in a public repository. `--publish-key` stages, commits and pushes the public key, so use it only with a private remote. Tailscale resolves peer names at run time, with `--peer NAME=HOST` or `POSTBOX_PEER_<NAME>=host[:port]` available as overrides. `--uninstall` removes only the forward created by this installation. To replace a peer key, use the documented link procedure on both Macs. The link tests use a Tailscale stand-in; a real link requires a configured tailnet.
 
 ## Security model
 
@@ -166,15 +170,9 @@ The installer saves keys as `peers/<machine>.pub` in the repo folder. Do not com
 
 ## Files
 
-| Where | What |
-|---|---|
-| `~/Library/Application Support/postbox/` | `nats-server.conf` (mode 600), `machine.seed` (this Mac's private key, mode 600, never leaves the Mac), `link.json` (linked Macs), `wake.json`, `aliases.json`, inbox and held-mail folders. `POSTBOX_SUPPORT_DIR` moves it. |
-| `~/Library/LaunchAgents/com.postbox.nats.plist`, `com.postbox.relay.plist` | The two services. |
-| `~/Library/Logs/postbox-nats.log`, `postbox-relay.log` | Logs. The relay log is JSON lines: `delivered`, `nobody_there`, `refused_*`, `forward_stored`, `forwarded`, `heartbeat`. |
-| `<repo>/jetstream/` | Mailbox data (git-ignored). `POSTBOX_STORE_DIR` moves it. |
-| `~/.local/bin/post` | Link to `bin/post`. |
+Postbox keeps generated service configuration, keys, peer and webhook settings, inboxes, held mail, logs and mailbox data in local per-user locations. These generated files and message data are separate from the public source files.
 
-Stop or start a service: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/<label>.plist` and `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist`. Restart the relay: `launchctl kickstart -k gui/$(id -u)/com.postbox.relay`.
+Use the platform service manager to stop, start, or restart the installed services.
 
 ### Settings (environment variables)
 
@@ -183,14 +181,14 @@ Stop or start a service: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/
 | `POSTBOX_DOORS` | the list in `postbox/doors.py` | Comma-separated doors to enable, replacing the file for that process. |
 | `POSTBOX_NATS_URL` | `nats://127.0.0.1:4222` | Which mailbox `post` and the relay use. |
 | `POSTBOX_MACHINE` | host name | This Mac's name in messages. |
-| `POSTBOX_SUPPORT_DIR`, `POSTBOX_STORE_DIR` | see Files | Where state and mailbox data live. |
+| `POSTBOX_SUPPORT_DIR`, `POSTBOX_STORE_DIR` | platform defaults | Where state and mailbox data live. |
 | `POSTBOX_MAX_AGE_S` | 604800 (7 days) | How long queued mail is kept. |
 | `POSTBOX_STALE_AFTER_S` | 1800 | Age after which mail gets the stale banner. |
 | `POSTBOX_PAIR_LIMIT`, `POSTBOX_PAIR_WINDOW_S`, `POSTBOX_RECIPIENT_LIMIT` | 30, 600, 120 | The stop rules. |
 | `POSTBOX_FORWARD_RETRY_S` | 60 | How often mail kept for a sleeping Mac is retried. |
 | `POSTBOX_AS` | unset | Sender identity when no session is detected (same as `--as`). |
 | `POSTBOX_TELEMETRY` | `0` | `1` turns on the metadata-only event log (`POSTBOX_TELEMETRY_SPOOL` picks the folder). |
-| `POSTBOX_ALARM_CMD`, `POSTBOX_SECRET_CMD` | unset | Optional helper commands (Codex "unseen" alarm; resolving `op://` references). |
+| `POSTBOX_ALARM_CMD`, `POSTBOX_SECRET_CMD` | unset | Optional helper commands for delivery diagnostics and wake webhook configuration. |
 
 ## Tests
 
@@ -202,7 +200,7 @@ fail=0; for t in tests/test_*.py; do .venv/bin/python "$t" || { echo "FAILED: $t
 Each suite that passes prints `N passed, 0 failed`, `ALL PASSED` or `OK` and exits 0; the loop above runs every suite and its last command exits non-zero if any suite failed. The suites work in throwaway folders, and a suite that needs a mailbox starts its own on a spare port. `tests/_env.py` turns the optional doors on for the suites that import it; `tests/test_doors.py` checks the shipped default (Claude only) end to end. `tools/scrub_check.py` is the release gate: it fails on a home folder path, private or tailnet address, real `op://` reference, login seed, or leftover `HANDOFF.md`, and with `--denylist FILE` also on your own private strings.
 
 Test guard. `tests/_guard.py` keeps the suites away from a post box that is running on this Mac. It needs macOS with `/usr/bin/sandbox-exec`, so run the suites from a normal Terminal window, not inside another sandbox (an AI tool's own sandbox counts). If the guard cannot set up that layer, a suite that imports it stops with exit code 3 and says why; no setting turns the layer off. Internals: see the docstrings at the top of `tests/_guard.py` and `tests/test_env_guard.py`.
-- Protected ports: 4222, the ports found in the launchd job files in `~/Library/LaunchAgents`, and the ports listed in `PBGUARD_PORTS` (comma separated).
+- Protected ports: 4222, ports discovered from the installed service definitions, and ports listed in `PBGUARD_PORTS` (comma separated).
 - Not covered: a connection to another host; a post box you started by hand on a port that is not protected; a `PBGUARD_PORTS` value set after the test run has started; a new suite that does not import `_env` or `_guard`.
 - 22 of the 24 suites in `tests/` import `_env` or `_guard`. The other two: `tests/test_env_guard.py` runs its probes in guarded child processes and exits with code 1, not 3, when a child cannot establish the layer; `tests/test_scrub_check.py` is a static scanner. `tests/test_env_guard.py` checks that README.md, AGENTS.md and CONTRIBUTING.md state this count.
 - `test_doors.py`, `test_hardening.py`, `test_install.py`, `test_link.py` and `test_session_addressing_e2e.py` start a `nats-server` of their own on a private port, and `test_doors.py`, `test_install.py` and `test_link.py` also run `install.py` with `--no-launchd` in a throwaway home. The guard does not stop suites from starting processes, so run these five only when that is acceptable.
