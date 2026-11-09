@@ -19,6 +19,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+try:
+    from .grok_door import GrokDoor as _GrokInboxDoor
+except ImportError:
+    from grok_door import GrokDoor as _GrokInboxDoor
+
 DEFAULT_PORT = 4222
 NATS_URL = os.environ.get("POSTBOX_NATS_URL", f"nats://127.0.0.1:{DEFAULT_PORT}")
 STREAM = "POST"
@@ -504,8 +509,7 @@ def reg_dir() -> Path:
 
 
 def process_start(pid) -> Optional[str]:
-    """When the process started, as `ps` prints it (`Fri Oct  2 14:55:19 2026`, whitespace squeezed), else None. A reused process number
-    starts at a different time, so a registration made for the old process never matches the new one."""
+    """Return a stable process start token, preferring the kernel's microsecond timestamp and falling back to `ps`."""
     try:
         identity = _process_identity_module().read_process_identity(pid)
         return f"{identity.start_sec}.{identity.start_usec:06d}"
@@ -1235,10 +1239,10 @@ def codex_context_screen_snapshot(table=None):
     return out
 
 
-def codex_discovery_snapshot():
+def codex_discovery_snapshot(project_filter=None):
     """Return screens and their claim-validation identity from one bounded process listing."""
     table = process_table()
-    return codex_sessions(table), codex_context_screen_snapshot(table)
+    return codex_sessions(table, project_filter=project_filter), codex_context_screen_snapshot(table)
 
 
 def _codex_claim_dir() -> Path:
@@ -1317,7 +1321,7 @@ def thread_context_claim_read(thread_id, now=None, sessions=None, snapshot=None)
     context = codex_thread_context(thread_id)
     if not context or context["cwd"] != rec["cwd"] or context["created_at"] != created:
         return None
-    user_threads = codex_user_thread_snapshot()
+    user_threads = codex_user_thread_snapshot({rec["cwd"]})
     try:
         newer = any(cwd == rec["cwd"] and float(created_at) > created for _tid, cwd, _updated, created_at in (user_threads or []))
     except (TypeError, ValueError):
@@ -1341,6 +1345,10 @@ def thread_context_claims(project=None, now=None, sessions=None, snapshot=None):
     rows = []
     for path in files:
         thread = path.stem
+        if project is not None:
+            record = _claim_record(thread)
+            if not record or not isinstance(record.get("project"), str) or not same_project(record["project"], project):
+                continue
         claim = thread_context_claim_read(thread, now, found, snap)
         if claim and (project is None or same_project(claim.project, project)):
             rows.append(claim)
@@ -1353,8 +1361,9 @@ def codex_claim_self(now=None):
     context = codex_thread_context(thread)
     if not context or context.get("source") != "user":
         return None
-    snapshot = codex_context_screen_snapshot()
-    sessions = codex_sessions()
+    table = process_table()
+    snapshot = codex_context_screen_snapshot(table)
+    sessions = codex_sessions(table)
     matching = [s for s in sessions if s.target == thread and s.ready and s.cwd == context["cwd"]
                 and any(row["pid"] == s.pid for row in snapshot)]
     if len(matching) != 1:
@@ -1399,7 +1408,7 @@ def codex_user_threads(cwd, since):
         return []
 
 
-def codex_user_thread_snapshot():
+def codex_user_thread_snapshot(cwds=None):
     """The eligible user threads in one read, or None when this Codex table cannot distinguish subagents."""
     import sqlite3
     db = codex_state_db()
@@ -1410,8 +1419,14 @@ def codex_user_thread_snapshot():
         if not {"thread_source", "created_at"} <= _codex_columns(con):
             con.close()
             return None
-        rows = con.execute("select id, cwd, updated_at, created_at from threads "
-                           "where archived=0 and thread_source='user' order by created_at desc").fetchall()
+        query = "select id, cwd, updated_at, created_at from threads where archived=0 and thread_source='user'"
+        if cwds is not None:
+            cwds = sorted({cwd for cwd in cwds if isinstance(cwd, str) and os.path.isabs(cwd)})
+            if not cwds:
+                con.close()
+                return []
+            query += " and cwd in (" + ",".join("?" for _ in cwds) + ")"
+        rows = con.execute(query + " order by created_at desc", tuple(cwds) if cwds is not None else ()).fetchall()
         con.close()
         return rows
     except Exception:
@@ -1472,7 +1487,7 @@ def codex_thread_updated(thread_id):
 
 
 def process_age_s(pid):
-    """Seconds since the process started (ps etime: [[dd-]hh:]mm:ss, no locale in it), else None."""
+    """Seconds since process start, preferring the kernel and falling back to `ps` elapsed time."""
     try:
         identity = _process_identity_module().read_process_identity(pid)
         return max(0, int(time.time() - (identity.start_sec + identity.start_usec / 1_000_000)))
@@ -1631,7 +1646,7 @@ def _codex_wrapper_args(argv):
     return None
 
 
-def codex_sessions(table=None):
+def codex_sessions(table=None, project_filter=None):
     """Live interactive Codex screens on this Mac, found from the process list plus Codex's thread table.
 
     A screen started with plain `codex` has no thread id in its arguments, so its thread is the newest one in its folder. Until the screen
@@ -1653,8 +1668,12 @@ def codex_sessions(table=None):
             if listed is not None and _native_process_token(pid) != before:
                 cwd = None
             screens.append((pid, thread, cwd))
+    if project_filter is not None:
+        projects = project_filter if isinstance(project_filter, (set, list, tuple)) else (project_filter,)
+        screens = [row for row in screens if row[2] and any(
+            same_project(_identity_project("codex", row[0], row[2]), project) for project in projects)]
     claimed = {t for _p, t, _c in screens if t}
-    threads = codex_user_thread_snapshot()
+    threads = codex_user_thread_snapshot({cwd for _pid, _thread, cwd in screens} if project_filter is not None else None)
     now = time.time()
     starts = {pid: (now - age - CODEX_THREAD_SLACK_S) if (age := process_age_s(pid)) is not None else None
               for pid, _thread, _cwd in screens}
@@ -1876,7 +1895,7 @@ class CodexDoor:
             sessions, screen_snapshot = self.sessions(), []
         else:
             table = process_table()
-            sessions = codex_sessions(table)
+            sessions = codex_sessions(table, project_filter=project)
             screen_snapshot = codex_context_screen_snapshot(table)
         direct = [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and s.ready]
         claims = thread_context_claims(project, sessions=sessions, snapshot=screen_snapshot)
@@ -1895,7 +1914,7 @@ class CodexDoor:
             sessions, snapshot = self.sessions(), []
         elif sessions is None:
             table = process_table()
-            sessions = codex_sessions(table)
+            sessions = codex_sessions(table, project_filter=project)
             snapshot = codex_context_screen_snapshot(table)
         else:
             # A supplied synthetic or already-discovered session set must not
@@ -2139,26 +2158,13 @@ def codex_watch_check(now=None) -> list:
     return settled
 
 
-class GrokDoor:
-    """Nothing outside a Grok screen can wake it, so its mail goes into its inbox and the session reads it with `post inbox`
-    (at the start of its turns, or when its `post inbox --watch` monitor rings). `delivered` therefore means: a live Grok session
-    in that project exists and the message is waiting in its inbox, and the sender is told plainly that it is read later, not now."""
-    agent = "grok"
+class GrokDoor(_GrokInboxDoor):
+    """Bind the portable inbox adapter to this package's discovery and storage functions."""
 
-    def resolve(self, project, exclude_pid=None, sessions=None):
-        sessions = grok_sessions() if sessions is None else sessions
-        match = [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid]
-        return match[:1]   # newest first, and one inbox per project: two targets would store the same message twice
-
-    def busy_note(self, session, now=None):
-        """The sentence the relay appends to `delivered` (asked before delivering, like the Codex mid-task note)."""
-        return f"{session.label} cannot be woken: it reads this from its inbox (post inbox) when its next turn starts, so an answer can take a while"
-
-    def render(self, from_addr, text, waited_s=None):
-        return render(from_addr, text, inbox=True, waited_s=waited_s)
-
-    def deliver(self, session, text, timeout=None):
-        inbox_put(self.agent, session.project, text)
+    def __init__(self):
+        super().__init__(sessions_provider=lambda: grok_sessions(), same_project=same_project,
+                         inbox_writer=lambda agent, project, text: inbox_put(agent, project, text),
+                         renderer=lambda *args, **kwargs: render(*args, **kwargs))
 
 
 class InboxSession(Session):

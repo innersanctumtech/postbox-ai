@@ -30,7 +30,7 @@ async def main():
     old_requeue = lib.codex_watch_requeue
     try:
         lib.codex_watch_check = lambda: entries
-        def discovery():
+        def discovery(project_filter=None):
             calls["discovery"] += 1
             return [first, second], [{"pid": 41, "start": "a"}, {"pid": 42, "start": "b"}]
         lib.codex_discovery_snapshot = discovery

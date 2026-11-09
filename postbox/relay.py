@@ -849,7 +849,10 @@ async def check_codex_seen(nc, doors=None):
     except Exception as e:  # noqa: BLE001
         log("relay_error", error="codex seen check failed: " + repr(e)[:120])
         return []
-    discovery = None
+    recovery_projects = {e.get("project") for e, result in settled
+                         if result in ("retry", "recover") and isinstance(e.get("project"), str)}
+    discovery = (await asyncio.to_thread(lib.codex_discovery_snapshot, recovery_projects)
+                 if recovery_projects else None)
     for e, result in settled:
         waited = int(time.time() - float(e.get("sent", time.time())))
         if result in ("retry", "recover"):
@@ -858,8 +861,6 @@ async def check_codex_seen(nc, doors=None):
             replacement = None
             try:
                 if isinstance(door, lib.CodexDoor) and project:
-                    if discovery is None:
-                        discovery = await asyncio.to_thread(lib.codex_discovery_snapshot)
                     screens, screen_ids = discovery
                     if type(door).candidates is lib.CodexDoor.candidates:
                         snapshot = await asyncio.to_thread(door.candidates, project, sessions=screens,
