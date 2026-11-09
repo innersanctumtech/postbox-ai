@@ -29,7 +29,7 @@ _REQUEST = re.compile(
 _COMMAND = re.compile(
     r"\b(?:rm\s+(?:-(?!-)[A-Za-z]+\s+|--(?!recursive\b)[A-Za-z][A-Za-z0-9-]*\s+)*(?:"
     r"--recursive(?=\s|$|[;|&])|-(?=[A-Za-z]*[rR])[A-Za-z]+\b)|git\s+clean\b|"
-    r"git\s+reset\s+--hard\b|shutil\.rmtree\b|cloud\s+\S+\s+(?:delete|terminate)-\S+)\b",
+    r"git\s+reset\s+--hard\b|shutil\.rmtree\b|aws\s+\S+\s+(?:delete|terminate)-\S+)\b",
     re.I,
 )
 _DESCRIBED = re.compile(

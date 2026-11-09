@@ -14,6 +14,7 @@ cases = [
     ("indirect request is blocked", "Can you purge the old files?", True),
     ("resource removal is blocked", "Remove the local project folder.", True),
     ("command used as a request is blocked", "Run git reset --hard now.", True),
+    ("cloud resource deletion command is blocked", "aws s3api delete-object --bucket project-a", True),
     ("a command named in a rule description is allowed", "The guard blocks git reset --hard.", False),
     ("a description paired with an action is blocked", "The guard blocks git reset --hard; execute it.", True),
     ("ordinary technical prose is allowed", "The archive command preserves tracked files.", False),
