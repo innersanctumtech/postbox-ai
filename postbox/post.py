@@ -11,6 +11,7 @@
   post inbox                 print and clear the messages waiting for THIS session (an agent that cannot be woken reads mail this way)
   post inbox --watch         stay running and print one short line each time new mail arrives; it never clears anything
   post whoami                say who post thinks you are, and how it found out
+  post status <message-id>   read recent local evidence for a sent publication
   post wake-test <agent>@<project>   call that inbox-only agent's wake webhook once (event "test") and say sent or failed; needs an entry in wake.json
                              (only when the grokbot-desktop door is on, see postbox/doors.py)
   post join <project>        make THIS session a member of <project> (and of no other) for as long as it runs; `post join` alone says which project
@@ -26,8 +27,8 @@ Examples:
 
 Only the agents whose door is switched on in postbox/doors.py can receive mail; `post --help` ends with the list.
 Sending is instant and free of AI cost. The other session wakes on its own and answers with `post`.
-Exit codes: 0 delivered, 2 could not send, 3 stored but nobody reachable yet (or, for another Mac, stored here to be forwarded), 4 refused,
-5 held (several sessions are open in that project and the message did not say which: the answer lists them and the `post pick` command for each).
+Exit codes: 0 delivered or evidence found, 2 could not send, 3 stored but nobody reachable yet (or, for another Mac, stored here to be forwarded), 4 refused,
+5 held (several sessions are open in that project and the message did not say which: the answer lists them and the `post pick` command for each), 6 unknown status.
 """
 from __future__ import annotations
 
@@ -43,6 +44,7 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import lib  # noqa: E402
+import delivery_status  # noqa: E402
 import wake  # noqa: E402
 
 tel = lib.telemetry   # metadata-only telemetry (postbox/telemetry.py); it never raises and never reads or stores a message body
@@ -476,6 +478,24 @@ def cmd_held(rest):
             print(f"      (no {agent} session is open in {project} right now)")
 
 
+def cmd_status(args):
+    """Read retained local relay evidence without publishing or modifying mail."""
+    if len(args) != 1:
+        die("post status needs exactly one publication message id", reason="bad_usage")
+    try:
+        result = delivery_status.lookup(lib.relay_log_path(), args[0])
+    except ValueError as exc:
+        die(str(exc), reason="bad_usage")
+    state = result["state"]
+    if state == "appeared":
+        print("APPEARED: matching recipient conversation evidence found; acknowledgement and task completion are not established.")
+    elif state == "handoff":
+        print("HANDOFF: relay recorded delivery to the recipient door; appearance and acknowledgement are not established.")
+    else:
+        print("UNKNOWN: no unique retained correlation was found. This does not prove loss; do not resend until reconciled.")
+        sys.exit(6)
+
+
 def cmd_inbox(rest, me):
     agent, project = me[0], lib.norm(me[1])
     if rest and rest[0] == "--watch" and len(rest) == 1:
@@ -525,6 +545,9 @@ def main(argv):
     if not args:
         print(usage_text())
         sys.exit(2)
+    if args[0] == "status":
+        cmd_status(args[1:])
+        return
     if args[0] == "wake-test":   # a check of the doorbell, not mail: no sender identity needed and no telemetry event of its own
         cmd_wake_test(args[1:])
         return
