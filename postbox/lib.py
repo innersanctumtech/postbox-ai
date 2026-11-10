@@ -15,7 +15,7 @@ import sys
 import time
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -383,6 +383,8 @@ class Session:
     note: str = ""          # one line when a marker or declaration was found but could not be used (shown by post who / post whoami)
     name: str = ""          # the session's own name, cleaned (Claude: /rename or the automatic one; Codex: the thread's name), "" when it has none
     sid: str = ""           # 6 hex characters of the session's own id: a second, always-unique-enough way to name it
+    claimed: bool = False   # whether a current exact context claim names this session
+    delivery_issue: str = ""  # one metadata-only delivery health state for post who
 
     @property
     def sock(self) -> str:
@@ -968,7 +970,21 @@ def grok_identity():
 
 def all_sessions():
     """Every live agent session this Mac can deliver to."""
-    return (claude_sessions() + (codex_sessions() if doors.enabled("codex") else []) + (grok_sessions() if doors.enabled("grok") else []))
+    sessions = claude_sessions()
+    if doors.enabled("codex"):
+        import inspect
+        if "table" in inspect.signature(codex_sessions).parameters:
+            screens, snapshot = codex_discovery_snapshot()
+        else:  # preserve the no-argument synthetic discovery seam
+            screens, snapshot = codex_sessions(), []
+        claims = thread_context_claims(sessions=screens, snapshot=snapshot)
+        claimed_pids = {getattr(s, "pid", None) for s in claims}
+        sessions.extend(s for s in screens if getattr(s, "pid", None) not in claimed_pids)
+        sessions.extend(replace(claim, claimed=True) for claim in claims)
+        sessions = [annotate_delivery_health(s) if getattr(s, "agent", None) == "codex" else s for s in sessions]
+    if doors.enabled("grok"):
+        sessions.extend(grok_sessions())
+    return sessions
 
 
 # ---------------------------------------------------------------- Inbox (for an agent that cannot be woken from outside: Grok)
@@ -1250,7 +1266,8 @@ def codex_context_screen_snapshot(table=None):
 def codex_discovery_snapshot(project_filter=None):
     """Return screens and their claim-validation identity from one bounded process listing."""
     table = process_table()
-    return codex_sessions(table, project_filter=project_filter), codex_context_screen_snapshot(table)
+    sessions = codex_sessions(table) if project_filter is None else codex_sessions(table, project_filter=project_filter)
+    return sessions, codex_context_screen_snapshot(table)
 
 
 def _codex_claim_dir() -> Path:
@@ -1884,7 +1901,7 @@ class CodexDoor:
     def sessions(self):
         return codex_sessions()
 
-    def candidates(self, project, exclude_pid=None, *, sessions=None, screen_snapshot=None):
+    def candidates(self, project, exclude_pid=None, *, sessions=None, screen_snapshot=None, exclude_thread=None):
         """Discover once, then project ready and waiting screens from that same snapshot."""
         # Older synthetic doors provide their own projections instead of a sessions()
         # source.  Keep that seam: their projection is already their snapshot.
@@ -1905,16 +1922,22 @@ class CodexDoor:
             table = process_table()
             sessions = codex_sessions(table, project_filter=project)
             screen_snapshot = codex_context_screen_snapshot(table)
-        direct = [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and s.ready]
-        claims = thread_context_claims(project, sessions=sessions, snapshot=screen_snapshot)
+        direct = [annotate_delivery_health(s) for s in sessions
+                  if same_project(s.project, project) and s.pid != exclude_pid and s.ready]
+        all_claims = [annotate_delivery_health(s) for s in thread_context_claims(
+            project, sessions=sessions, snapshot=screen_snapshot)]
+        claims = [s for s in all_claims if s.pid != exclude_pid and s.target != exclude_thread]
         merged = {s.target: s for s in direct}
         merged.update({s.target: s for s in claims})
-        claimed_pids = {s.pid for s in claims}
+        claimed_pids = {s.pid for s in all_claims}
+        waiting = [s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid
+                   and not s.ready and s.pid not in claimed_pids]
+        waiting.extend(s for s in merged.values() if s.delivery_issue
+                       and s.pid != exclude_pid and s.target != exclude_thread)
         return CodexCandidates(
-            ready=list(merged.values()),
-            waiting=[s for s in sessions if same_project(s.project, project) and s.pid != exclude_pid and not s.ready
-                     and s.pid not in claimed_pids],
-            has_context_claim=bool(claims),
+            ready=[s for s in merged.values() if s.ready],
+            waiting=waiting,
+            has_context_claim=bool(all_claims),
         )
 
     def resolve(self, project, exclude_pid=None, sessions=None, exclude_thread=None):
@@ -1932,7 +1955,8 @@ class CodexDoor:
         claims = thread_context_claims(project, sessions=sessions, snapshot=snapshot)
         merged = {s.target: s for s in direct}
         merged.update({s.target: s for s in claims})
-        return [s for thread, s in merged.items() if thread != exclude_thread]
+        return [annotate_delivery_health(s) for thread, s in merged.items()
+                if thread != exclude_thread and not read_delivery_health(thread)]
 
     def waiting(self, project, exclude_pid=None, sessions=None):
         """Screens in this project that are open but have no conversation of their own yet (mail for them is kept, not delivered)."""
@@ -1971,6 +1995,113 @@ class CodexDoor:
 CODEX_SEEN_AFTER_S = float(os.environ.get("POSTBOX_CODEX_SEEN_S", "600"))
 CODEX_SEEN_MAX_S = float(os.environ.get("POSTBOX_CODEX_SEEN_MAX_S", "7200"))
 CODEX_SNIPPET = 100
+DELIVERY_HEALTH_RECHECK_S = 30.0
+_HEALTH_LAST_TRY = {}
+
+
+def _delivery_health_dir() -> Path:
+    return Path(os.environ.get("POSTBOX_DELIVERY_HEALTH") or support_dir() / "delivery-health")
+
+
+def record_unseen_delivery(thread, delivery_id) -> bool:
+    """Persist only the exact thread and opaque reference needed to clear an unseen flag."""
+    thread, delivery_id = str(thread or ""), str(delivery_id or "")
+    if not UUID_RE.fullmatch(thread) or not re.fullmatch(r"[0-9a-f]{32}", delivery_id):
+        return False
+    directory = _delivery_health_dir()
+    path = directory / f"{thread}.json"
+    temp = directory / f".{thread}.{uuid.uuid4().hex}.tmp"
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump({"thread": thread, "delivery_id": delivery_id, "state": "unseen"}, out)
+        os.replace(temp, path)
+        return True
+    except OSError:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def read_delivery_health(thread):
+    if not UUID_RE.fullmatch(str(thread or "")):
+        return ""
+    path = _delivery_health_dir() / f"{thread}.json"
+    try:
+        if path.is_symlink() or path.stat().st_size > 4096:
+            return ""
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(data, dict) or data.get("thread") != thread
+                or data.get("state") != "unseen"
+                or not re.fullmatch(r"[0-9a-f]{32}", str(data.get("delivery_id", "")))):
+            return ""
+        return "last_delivery_not_seen"
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
+def annotate_delivery_health(session):
+    issue = read_delivery_health(session.target) if session.target else ""
+    return replace(session, ready=False, delivery_issue=issue) if issue else session
+
+
+def reconcile_delivery_health(now=None, directory=None, rollout_of=None):
+    """Clear an unseen flag only after its exact context is claimed again or its own log advances."""
+    now = time.monotonic() if now is None else now
+    directory = Path(directory) if directory is not None else _delivery_health_dir()
+    rollout_of = rollout_of or codex_thread_rollout
+    cleared = []
+    try:
+        paths = sorted(directory.glob("*.json"))
+    except OSError:
+        return cleared
+    claims_by_thread = None
+    for path in paths:
+        try:
+            thread = path.stem
+            marker_stat = path.stat()
+            if not UUID_RE.fullmatch(thread) or path.is_symlink() or marker_stat.st_size > 4096:
+                continue
+            marker = json.loads(path.read_text(encoding="utf-8"))
+            delivery_id = marker.get("delivery_id") if isinstance(marker, dict) else None
+            if (not isinstance(marker, dict) or marker.get("thread") != thread
+                    or marker.get("state") != "unseen"
+                    or not re.fullmatch(r"[0-9a-f]{32}", str(delivery_id or ""))):
+                continue
+            key = (thread, delivery_id)
+            if now - _HEALTH_LAST_TRY.get(key, -1e9) < DELIVERY_HEALTH_RECHECK_S:
+                continue
+            _HEALTH_LAST_TRY[key] = now
+            if claims_by_thread is None:
+                claims_by_thread = {s.target: s for s in thread_context_claims() if s.target}
+            claim_path = _codex_claim_path(thread)
+            claimed_after = False
+            if thread in claims_by_thread and claim_path is not None and not claim_path.is_symlink():
+                claimed_after = claim_path.stat().st_mtime > marker_stat.st_mtime
+            rollout = rollout_of(thread)
+            log_after = False
+            if rollout:
+                try:
+                    log_after = Path(rollout).stat().st_mtime > marker_stat.st_mtime + 30.0
+                except OSError:
+                    pass
+            if not (claimed_after or log_after):
+                continue
+            again = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(again, dict) or again.get("thread") != thread
+                    or again.get("delivery_id") != delivery_id or again.get("state") != "unseen"):
+                continue
+            archive = directory / f"{thread}.cleared-{delivery_id[:8]}-{time.time_ns()}.json"
+            os.replace(path, archive)
+            _HEALTH_LAST_TRY.pop(key, None)
+            cleared.append(thread)
+        except (OSError, ValueError, TypeError):
+            continue
+    return cleared
 
 
 def _codex_watch_file() -> Path:

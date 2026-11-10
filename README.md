@@ -8,7 +8,7 @@ You run Claude Code, Codex and Grok in separate windows, and you carry results b
 
 ## Version 2.0.0
 
-Version 2.0.0 carries portable Postbox 0.3.1 functionality in the public project structure. It adds exact matching for multiple Codex screens, safer process identity and reuse checks, asynchronous relay maintenance, fairer message batches, and stronger delivery evidence and recovery. It also includes explicit post status, the Grok door, delivery confirmations and fences, and metadata diagnostics for stuck messages. See [the history](docs/HISTORY.md) and [Grok Desks](docs/GROK-DESKS.md) for details. These are release capabilities; this note does not claim a live installation or release readiness.
+Version 2.0.0 carries portable Postbox 0.3.2 functionality in the public project structure. It adds exact matching for multiple Codex screens, safer process identity and reuse checks, asynchronous relay maintenance, fairer message batches, and stronger delivery evidence and recovery. It also includes explicit post status, the Grok door, delivery confirmations and fences, metadata diagnostics for stuck messages, relay-backed local session listings, and recovery of stale unseen-delivery flags when the exact conversation is claimed again or its own log advances after the verdict. See [the history](docs/HISTORY.md) and [Grok Desks](docs/GROK-DESKS.md) for details. These are release capabilities; this note does not claim a live installation or release readiness.
 
 What you get:
 
@@ -106,6 +106,8 @@ If this asks a question or needs action, reply by RUNNING this shell command (ty
 
 After sending, the sender ends its turn. The reply arrives later as a new message.
 
+On this Mac, `post who` asks the relay for the sessions it can reach. If the relay does not answer or returns unusable data, it says so and falls back to local discovery. A `last delivery not seen` note clears when that exact conversation has a valid context claim written after the verdict, or when its own log has been written more than 30 seconds after the verdict. Text in the conversation does not clear the note by itself.
+
 ### Results
 
 | Word | Exit | Meaning |
@@ -202,7 +204,7 @@ Each suite that passes prints `N passed, 0 failed`, `ALL PASSED` or `OK` and exi
 Test guard. `tests/_guard.py` keeps the suites away from a post box that is running on this Mac. It needs macOS with `/usr/bin/sandbox-exec`, so run the suites from a normal Terminal window, not inside another sandbox (an AI tool's own sandbox counts). If the guard cannot set up that layer, a suite that imports it stops with exit code 3 and says why; no setting turns the layer off. Internals: see the docstrings at the top of `tests/_guard.py` and `tests/test_env_guard.py`.
 - Protected ports: 4222, ports discovered from the installed service definitions, and ports listed in `PBGUARD_PORTS` (comma separated).
 - Not covered: a connection to another host; a post box you started by hand on a port that is not protected; a `PBGUARD_PORTS` value set after the test run has started; a new suite that does not import `_env` or `_guard`.
-- 30 of the 36 suites in `tests/` import `_env` or `_guard`. The six standalone suites cover this guard, the static scrub tool, or portable helpers without mailbox or process access. `tests/test_env_guard.py` checks that README.md, AGENTS.md and CONTRIBUTING.md state this count.
+- 32 of the 38 suites in `tests/` import `_env` or `_guard`. Six intentionally do not: the guard and scrub self-checks, plus four portable helper suites without mailbox or process access. `tests/test_env_guard.py` checks that README.md, AGENTS.md and CONTRIBUTING.md state this count.
 - `test_doors.py`, `test_hardening.py`, `test_install.py`, `test_link.py` and `test_session_addressing_e2e.py` start a `nats-server` of their own on a private port, and `test_doors.py`, `test_install.py` and `test_link.py` also run `install.py` with `--no-launchd` in a throwaway home. The guard does not stop suites from starting processes, so run these five only when that is acceptable.
 
 ## Contributing and license

@@ -291,6 +291,11 @@ async def quiet_round(nc, js, quiet_rounds):
     log("idle_quiet_start", round=quiet_rounds)
     await check_codex_seen(nc)
     log("idle_quiet_codex_done")
+    try:
+        for thread in await asyncio.to_thread(lib.reconcile_delivery_health):
+            log("delivery_health_reconciled", thread=thread)
+    except Exception as exc:  # noqa: BLE001 - reconciliation must never stop delivery
+        log("relay_error", error=f"delivery health reconciliation failed: {type(exc).__name__}")
     await check_stuck_holds()
     if quiet_rounds % 12 == 0:
         log("heartbeat")
@@ -694,7 +699,7 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
 
     t_resolve = time.monotonic()
     if agent == "codex" and isinstance(door, lib.CodexDoor):
-        candidate_snapshot = await asyncio.to_thread(door.candidates, project, from_pid)
+        candidate_snapshot = await asyncio.to_thread(door.candidates, project, from_pid, exclude_thread=from_thread)
         targets = candidate_snapshot.ready
         waiting = candidate_snapshot.waiting
         has_context_claim = candidate_snapshot.has_context_claim
@@ -942,6 +947,14 @@ async def check_codex_seen(nc, doors=None):
             log("codex_seen", to=e.get("to"), frm=e.get("frm"), after_s=waited)
             tel.emit("post_codex_seen", "relay", status="ok", after_s=waited)
             continue
+        if lib.UUID_RE.fullmatch(str(e.get("thread", ""))):
+            try:
+                reference = delivery_correlation_id(e.get("id", ""), e.get("thread", ""))
+                recorded = await asyncio.to_thread(lib.record_unseen_delivery, e.get("thread", ""), reference)
+                if not recorded:
+                    log("delivery_health_record_failed", thread=e.get("thread"))
+            except Exception as exc:  # noqa: BLE001 - the existing unseen notice remains the fallback
+                log("delivery_health_record_failed", error=type(exc).__name__)
         log("codex_unseen", to=e.get("to"), frm=e.get("frm"), after_s=waited, thread=e.get("thread"))
         tel.emit("post_codex_unseen", "relay", status="error", after_s=waited)
         when = time.strftime("%H:%M", time.localtime(float(e.get("sent", time.time()))))
@@ -1088,8 +1101,29 @@ async def answer_who(nc, msg):
     if not msg.reply or not lib.INBOX_RE.match(msg.reply):
         return
     sessions = await asyncio.to_thread(lib.all_sessions)
-    body = {"machine": lib.my_machine(), "sessions": [dict({"agent": s.agent, "project": lib.norm(s.project), "pid": s.pid},
-                                                              **({"name": s.name} if s.name else {}), **({"sid": s.sid} if s.sid else {})) for s in sessions]}
+    def safe_note(value):
+        value = " ".join("".join(ch for ch in value if ch.isprintable()).split()) if isinstance(value, str) else ""
+        return value if len(value) <= 120 and "/" not in value and "\\" not in value and "~" not in value else ""
+    rows = []
+    for s in sessions:
+        folder = os.path.basename(str(s.cwd).rstrip("/")) if s.cwd else ""
+        row = {"agent": s.agent, "project": lib.norm(s.project), "pid": s.pid, "ready": bool(s.ready),
+               "folder": folder, "source": s.source if s.source in ("folder", "marker", "declaration") else "folder"}
+        if s.name:
+            row["name"] = s.name
+        if s.sid:
+            row["sid"] = s.sid
+        note_text = safe_note(s.note)
+        if note_text:
+            row["note"] = note_text
+        if getattr(s, "claimed", False) and lib.UUID_RE.fullmatch(str(s.target or "")):
+            row.update({"claimed": True, "thread": s.target})
+        if getattr(s, "delivery_issue", "") == "last_delivery_not_seen":
+            row["delivery_issue"] = "last_delivery_not_seen"
+        rows.append(row)
+    body = {"machine": lib.my_machine(), "sessions": rows,
+            "inbox_only": [{"agent": agent, "project": project, "waiting": waiting}
+                           for agent, project, waiting in lib.inbox_only_agents()]}
     await nc.publish(msg.reply, json.dumps(body).encode())
     await nc.flush(timeout=2)
     tel.emit("post_who", "relay", side="answered", sessions_n=len(sessions), by_agent=dict(collections.Counter(s.agent for s in sessions)))

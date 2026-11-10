@@ -77,7 +77,7 @@ entry = lib.codex_watch_get("message-opaque-2")
 
 class Door(lib.CodexDoor):
     def __init__(self): self.calls = []
-    def candidates(self, project, exclude_pid=None):
+    def candidates(self, project, exclude_pid=None, *, exclude_thread=None):
         return lib.CodexCandidates([S2], [])
     def deliver(self, session, body, timeout=25.0):
         self.calls.append((session.target, body))
@@ -101,7 +101,7 @@ blocked = lib.codex_watch_get("message-opaque-3")
 
 
 class AmbiguousDoor(Door):
-    def candidates(self, project, exclude_pid=None):
+    def candidates(self, project, exclude_pid=None, *, exclude_thread=None):
         return lib.CodexCandidates([S2], [W])
 
 
@@ -135,7 +135,8 @@ print("-- relay path avoids duplicate queue calls")
 class Msg:
     def __init__(self, delivered):
         self.subject, self.data = "post.project.codex", b"one queued payload"
-        self.headers = {"From": "claude@project", "From-Pid": "1", "Nats-Msg-Id": "stable-stream-id"}
+        self.headers = {"From": "claude@project", "From-Pid": "1", "From-Thread": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        "Nats-Msg-Id": "stable-stream-id"}
         self.metadata = type("Meta", (), {"num_delivered": delivered, "sequence": type("Seq", (), {"stream": 88})()})()
         self.acked = self.naked = None
     async def ack(self): self.acked = True
@@ -150,7 +151,11 @@ class NC:
 
 
 class FixedDoor(Door):
-    def candidates(self, project, exclude_pid=None):
+    def __init__(self):
+        super().__init__()
+        self.exclusions = None
+    def candidates(self, project, exclude_pid=None, *, exclude_thread=None):
+        self.exclusions = (exclude_pid, exclude_thread)
         return lib.CodexCandidates([S2], [])
 
 
@@ -159,6 +164,8 @@ first_msg, second_msg, nc = Msg(1), Msg(2), NC()
 asyncio.run(relay.handle(nc, first_msg, {"codex": fixed}, lib.PairLimiter(), lib.PairLimiter(limit=100)))
 asyncio.run(relay.handle(nc, second_msg, {"codex": fixed}, lib.PairLimiter(), lib.PairLimiter(limit=100)))
 check("redelivery after queue acceptance is acknowledged without a second queue call", first_msg.acked and second_msg.acked and len(fixed.calls) == 1, fixed.calls)
+check("relay passes sender PID and exact thread to candidate discovery",
+      fixed.exclusions == (1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), fixed.exclusions)
 
 print("-- relay emits the held threshold payload")
 relay.STUCK_NOTIFY_CMD = [sys.executable, hook, capture]

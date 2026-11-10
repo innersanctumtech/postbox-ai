@@ -422,7 +422,10 @@ class WhoNC(FakeNC):
 
 with mock.patch.object(lib, "claude_sessions", lambda: []), mock.patch.object(lib, "codex_sessions", lambda: []), mock.patch.object(lib, "grok_sessions", lambda: [GS]):
     run(relay.answer_who(WhoNC(), types.SimpleNamespace(reply="_INBOX.who")))
-    check("another Mac asking who is here sees the Grok session, as an address it can type", box and box[0]["sessions"] == [{"agent": "grok", "project": "grok", "pid": 75656}], str(box))
+    check("another Mac asking who is here sees the Grok session, as an address it can type",
+          box and box[0]["sessions"] == [{"agent": "grok", "project": "grok", "pid": 75656,
+                                           "ready": True, "folder": ".grok", "source": "folder"}]
+          and box[0]["inbox_only"] == [], str(box))
     with mock.patch.object(lib, "my_identity", return_value=("grok", ".grok", 75656)):
         code, out, _ = cli(["post", "who"])
     check("post who lists it and marks it as this session", "grok@grok" in out and "pid 75656" in out and "<- this session" in out, out)

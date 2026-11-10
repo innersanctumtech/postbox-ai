@@ -153,6 +153,53 @@ async def remote_who(machine):
     return json.loads(reply.data)
 
 
+async def local_relay_who():
+    """Ask the local relay for the session view it can actually deliver to."""
+    nc = await lib.connect_fast(lib.local_target(), timeout=2)
+    try:
+        reply = await nc.request("who.sessions", b"", timeout=4)
+    finally:
+        await nc.close()
+    return json.loads(reply.data)
+
+
+def sessions_from_relay(info):
+    """Convert the relay's path-free view to display records; None means unusable reply."""
+    if not isinstance(info, dict) or not isinstance(info.get("sessions"), list):
+        return None
+    raw_rows = info["sessions"]
+    sessions = []
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        agent, project = row.get("agent"), row.get("project")
+        pid = row.get("pid")
+        if (not isinstance(agent, str) or not isinstance(project, str)
+                or agent not in lib.doors.ALL_DOORS or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1):
+            continue
+        project = lib.norm(project)
+        if not project:
+            continue
+        folder = row.get("folder")
+        if not isinstance(folder, str) or not folder or folder in (".", "..") or "/" in folder or "\\" in folder:
+            folder = project
+        source = row.get("source") if row.get("source") in ("folder", "marker", "declaration") else "folder"
+        raw_note = row.get("note")
+        note_text = " ".join("".join(ch for ch in raw_note if ch.isprintable()).split()) if isinstance(raw_note, str) else ""
+        if len(note_text) > 120 or "/" in note_text or "\\" in note_text or "~" in note_text:
+            note_text = ""
+        claimed = row.get("claimed") is True
+        thread = row.get("thread") if claimed else ""
+        if claimed and not lib.UUID_RE.fullmatch(str(thread or "")):
+            continue
+        sid = row.get("sid") if isinstance(row.get("sid"), str) and re.fullmatch(r"[0-9a-f]{6}", row["sid"]) else ""
+        name = lib.valid_session(row.get("name") or sid) or ""
+        delivery_issue = "last_delivery_not_seen" if row.get("delivery_issue") == "last_delivery_not_seen" else ""
+        sessions.append(lib.Session(agent, pid, folder, lib.norm(project), thread or "", bool(row.get("ready")),
+                                    source, "", note_text, name, sid, claimed, delivery_issue))
+    return None if raw_rows and not sessions else sessions
+
+
 def cmd_who(rest):
     machine = lib.norm(rest[0]) if rest else None
     if machine and machine != lib.my_machine():
@@ -183,12 +230,44 @@ def cmd_who(rest):
         return
     me = lib.my_identity()
     note(identity_method=lib.IDENTITY_TRACE.get("method"), remote=False)
+    relay_silent = False
+    try:
+        info = asyncio.run(asyncio.wait_for(local_relay_who(), 8))
+        relay_sessions = sessions_from_relay(info)
+    except Exception:  # noqa: BLE001 - the local relay can be stopped while discovery still works
+        relay_sessions = None
+        relay_silent = True
+    if relay_sessions is None:
+        reason = "did not answer" if relay_silent else "returned unusable data"
+        print(f"The local relay {reason}; showing local discovery instead.")
+        found_at = time.monotonic()
+        sessions = lib.all_sessions()
+        note(sessions_n=len(sessions), by_agent=dict(collections.Counter(s.agent for s in sessions)), discover_ms=tel.elapsed_ms(found_at),
+             who_source="local_fallback")
+        inbox_agents = lib.inbox_only_agents()
+    else:
+        sessions = relay_sessions
+        note(sessions_n=len(sessions), by_agent=dict(collections.Counter(s.agent for s in sessions)), who_source="relay")
+        inbox_rows = info.get("inbox_only")
+        if isinstance(inbox_rows, list):
+            inbox_agents = []
+            for row in inbox_rows:
+                if not isinstance(row, dict) or not isinstance(row.get("agent"), str) or not isinstance(row.get("project"), str):
+                    continue
+                agent, project = row["agent"], lib.norm(row["project"])
+                if agent not in lib.doors.ALL_DOORS or not project:
+                    continue
+                waiting = row.get("waiting", 0)
+                if isinstance(waiting, bool) or not isinstance(waiting, int) or waiting < 0:
+                    waiting = 0
+                inbox_agents.append((agent, project, waiting))
+        else:
+            inbox_agents = lib.inbox_only_agents()
     print("Reachable now (agent@project):")
-    found_at = time.monotonic()
-    sessions = lib.all_sessions()
-    note(sessions_n=len(sessions), by_agent=dict(collections.Counter(s.agent for s in sessions)), discover_ms=tel.elapsed_ms(found_at))
     for s in sessions:
-        mark = "   <- this session" if me and s.pid == me[2] else ""
+        own_process = bool(me and s.pid == me[2])
+        own_claim = bool(s.claimed and os.environ.get("CODEX_THREAD_ID") == s.target)
+        mark = "   <- this session" if own_process or own_claim else ""
         shown = lib.norm(s.project)   # the address you can type; the folder name follows when it differs
         folder_name = os.path.basename(s.cwd.rstrip("/")) or s.cwd
         folder = f"  [folder {folder_name}]" if shown != folder_name else ""
@@ -198,7 +277,8 @@ def cmd_who(rest):
         print(f"  {s.agent}@{shown:<24} pid {s.pid}{named}{folder}{idle}{tag}{mark}")
         if s.note:
             print(f"      note: {s.note}")
-    inbox_agents = lib.inbox_only_agents()   # agents the box cannot discover (grokbot-desktop): listed only once their inbox exists
+        if s.delivery_issue == "last_delivery_not_seen":
+            print("      last delivery not seen")
     wake_entries = wake.load_wake()
     for agent, project, waiting in inbox_agents:
         print(f"  {agent}@{project:<24} (inbox, {waiting} waiting; cannot be woken)  wake: {'configured (own webhook)' if wake.wake_key(agent, project) in wake_entries else 'configured' if wake.wake_key(agent) in wake_entries else 'not configured'}")

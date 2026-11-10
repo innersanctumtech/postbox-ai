@@ -4,7 +4,7 @@
 The guard probes run in guarded child processes against a stand-in listener on a spare port. The parent process opens that listener, looks up this Mac's local addresses
 (a UDP connect to a documentation-range address, which sends nothing, and /sbin/ifconfig) and checks the suite inventory and the doc text.
 If the first child cannot establish the operating-system layer, this suite prints FAILED (not skipped) and exits 1, not 3 (the child is what exits 3).
-30 of the 36 suites import the guard directly. The six standalone suites cover this guard, the static scrub tool, or portable helpers without mailbox or process access.
+32 of the 38 suites import the guard directly. The six without those imports are the guard and scrub self-checks plus four portable helper suites without mailbox or process access.
 Run: python3 tests/test_env_guard.py   (from a normal Terminal on macOS, not from inside another sandbox)
 """
 import os
