@@ -2,17 +2,17 @@
 
 **Let your AIs talk to each other.**
 
-You run Claude Code, Codex and Grok in separate windows, and you carry results between them by hand. The post box removes you from that loop. One AI session runs `post codex "review my change"`; the other session wakes up with that message in its conversation, does the work, and answers with the exact command that was attached to the message. It works between sessions in one project, between projects, between different AI tools, and between two linked Macs. Waiting costs nothing: no AI runs until a message arrives.
+You run Claude Code, Codex, Grok and GitHub Copilot in separate windows, and you carry results between them by hand. The post box removes you from that loop. One AI session runs `post codex "review my change"`; a receiving session can get the message in its conversation, or an inbox-only agent can read it later with `post inbox`. It works between sessions in one project, between projects, between different AI tools, and between two linked Macs. Waiting costs nothing: no AI runs until a message arrives.
 
 **If you are an AI agent, read [AGENTS.md](AGENTS.md).** It has the install commands, the check, the status words and troubleshooting guidance in order. Claude Code readers: [CLAUDE.md](CLAUDE.md) points there.
 
-## Version 2.0.0
+## Version 2.1.0
 
-Version 2.0.0 carries portable Postbox 0.3.2 functionality in the public project structure. It adds exact matching for multiple Codex screens, safer process identity and reuse checks, asynchronous relay maintenance, fairer message batches, and stronger delivery evidence and recovery. It also includes explicit post status, the Grok door, delivery confirmations and fences, metadata diagnostics for stuck messages, relay-backed local session listings, and recovery of stale unseen-delivery flags when the exact conversation is claimed again or its own log advances after the verdict. See [the history](docs/HISTORY.md) and [Grok Desks](docs/GROK-DESKS.md) for details. These are release capabilities; this note does not claim a live installation or release readiness.
+Version 2.1.0 adds an inbox-only GitHub Copilot door to the 2.0.0 public release. Copilot identifies itself with `post --as copilot@<project>`, registers its inbox on the first read, and reads mail with `post --as copilot@<project> inbox`. The destination appears in `post who` on the receiving Mac before mail arrives. Inbox delivery is stored for later reading; it does not wake a Copilot session or prove that a message was read. See [GitHub Copilot](docs/COPILOT.md) and [the history](docs/HISTORY.md).
 
 What you get:
 
-- **One command between AI tools.** Claude Code, Codex, Grok and Grok Bot desktop each have a built-in "door" (how the relay hands a message to that kind of agent). In this release only the Claude Code door is switched on; the others are built in, tested, and switched on by one file ([Other doors](#other-doors)). Until you switch a door on, mail for that tool is `refused` with the reason `no_door`.
+- **One command between AI tools.** Claude Code, Codex, Grok, Grok Bot desktop and GitHub Copilot each have a built-in "door" (how the relay hands a message to that kind of agent). In this release only the Claude Code door is switched on; the others are built in, tested, and switched on by one file ([Other doors](#other-doors)). Until you switch a door on, mail for that tool is `refused` with the reason `no_door`.
 - **Across your Macs.** Mail for a linked Mac that is asleep is stored on the sender's Mac and handed over when the other Mac answers.
 - **Honest results.** A send that reaches the post box ends in one of four words: `delivered`, `queued` (stored, delivery not confirmed yet; kept 7 days), `held` (several sessions are open and you named none) or `refused` (with the reason). If `post` cannot send at all it prints a `post:` error line and exits 2.
 - **Safe by default.** The mailbox listens on `127.0.0.1` only, clients log in with a key (see "Security model"), senders are rate limited, messages are capped at 32,000 bytes, and mail older than 30 minutes arrives with a "do not act yet, ask the sender" banner.
@@ -138,6 +138,7 @@ ENABLED_DOORS = {
     # "codex",            # OpenAI Codex CLI (needs `codex` on PATH)
     # "grok",             # xAI Grok CLI (inbox file, no wake)
     # "grokbot-desktop",  # Grok Bot desktop via webhook (needs wake.json)
+    # "copilot",          # GitHub Copilot inbox (no wake)
 }
 ```
 
@@ -149,6 +150,7 @@ Mail for an agent whose door is off is refused with the reason `no_door`. The en
 - **Codex** screens are matched to exact conversations using process and thread evidence. Multiple screens are supported; delivery is confirmed against the intended conversation, and unresolved delivery is reported explicitly. Codex reads mail between tasks.
 - **Grok** (the command line tool) uses a project inbox and cannot be woken. Mail waits in the inbox; run `post inbox` to read it. `post inbox --watch` checks for new mail, and `post inbox --history` shows recently read mail.
 - **Grok Bot desktop** is a separate app from Grok CLI. Its agent name is `grokbot-desktop`; identify it with `post --as grokbot-desktop@project-a ...`. It reads a project inbox. An optional wake webhook can notify it after delivery. See [Grok Desks](docs/GROK-DESKS.md) and `examples/wake.json.example` for configuration details. A project-specific Desk can receive mail addressed to the general Grok Bot identity when desk redirection is enabled.
+- **GitHub Copilot** uses an inbox because Postbox cannot discover or wake its sessions. Identify it with `post --as copilot@project-a`; the first `post --as copilot@project-a inbox` read creates an empty inbox, making that destination visible to `post who`. Setup and limits are in [GitHub Copilot](docs/COPILOT.md).
 
 ## Link two Macs
 
@@ -204,7 +206,7 @@ Each suite that passes prints `N passed, 0 failed`, `ALL PASSED` or `OK` and exi
 Test guard. `tests/_guard.py` keeps the suites away from a post box that is running on this Mac. It needs macOS with `/usr/bin/sandbox-exec`, so run the suites from a normal Terminal window, not inside another sandbox (an AI tool's own sandbox counts). If the guard cannot set up that layer, a suite that imports it stops with exit code 3 and says why; no setting turns the layer off. Internals: see the docstrings at the top of `tests/_guard.py` and `tests/test_env_guard.py`.
 - Protected ports: 4222, ports discovered from the installed service definitions, and ports listed in `PBGUARD_PORTS` (comma separated).
 - Not covered: a connection to another host; a post box you started by hand on a port that is not protected; a `PBGUARD_PORTS` value set after the test run has started; a new suite that does not import `_env` or `_guard`.
-- 32 of the 38 suites in `tests/` import `_env` or `_guard`. Six intentionally do not: the guard and scrub self-checks, plus four portable helper suites without mailbox or process access. `tests/test_env_guard.py` checks that README.md, AGENTS.md and CONTRIBUTING.md state this count.
+- 33 of the 39 suites in `tests/` import `_env` or `_guard`. Six intentionally do not: the guard and scrub self-checks, plus four portable helper suites without mailbox or process access. `tests/test_env_guard.py` checks that README.md, AGENTS.md and CONTRIBUTING.md state this count.
 - `test_doors.py`, `test_hardening.py`, `test_install.py`, `test_link.py` and `test_session_addressing_e2e.py` start a `nats-server` of their own on a private port, and `test_doors.py`, `test_install.py` and `test_link.py` also run `install.py` with `--no-launchd` in a throwaway home. The guard does not stop suites from starting processes, so run these five only when that is acceptable.
 
 ## Contributing and license

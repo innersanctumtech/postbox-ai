@@ -5,6 +5,8 @@ description: Use when the user says to message, tell, ask, or notify another age
 
 # post - message another agent session
 
+Postbox 2.1.0 includes an optional inbox-only GitHub Copilot door. For Copilot, `delivered:` means the message is stored for later reading; it does not confirm that Copilot read it. The first Copilot inbox read registers that destination, which appears in `post who` on the receiving Mac.
+
 Run the shell command (typing it in chat sends nothing):
 
 ```

@@ -1,6 +1,6 @@
 """Which delivery doors the post box has switched on.
 
-A "door" is the way the relay hands a message to one kind of agent (Claude Code, Codex CLI, Grok CLI, Grok Bot desktop).
+A "door" is the way the relay hands a message to one kind of agent (Claude Code, Codex CLI, Grok CLI, Grok Bot desktop, or GitHub Copilot inbox).
 Only the doors listed in ENABLED_DOORS are active. The code for every door stays in this repo and stays tested; the other
 doors are simply switched off.
 
@@ -22,9 +22,10 @@ ENABLED_DOORS = {
     # "codex",            # Codex CLI (needs `codex` on PATH)
     # "grok",             # xAI Grok CLI (inbox file, no wake)
     # "grokbot-desktop",  # Grok Bot desktop via webhook (needs wake.json)
+    # "copilot",          # GitHub Copilot inbox (the agent reads it with post --as)
 }
 
-ALL_DOORS = ("claude", "codex", "grok", "grokbot-desktop")   # every door the code knows about, on or off
+ALL_DOORS = ("claude", "codex", "grok", "grokbot-desktop", "copilot")   # every door the code knows about, on or off
 ENV_NAME = "POSTBOX_DOORS"
 
 
@@ -42,7 +43,7 @@ def enabled(name):
 
 
 def describe():
-    """One line for help and install output, for example 'claude (off: codex, grok, grokbot-desktop)'."""
+    """One line for help and install output, for example 'claude (off: codex, grok, grokbot-desktop, copilot)'."""
     on = enabled_names()
     off = [name for name in ALL_DOORS if name not in on]
     return ", ".join(name for name in ALL_DOORS if name in on) + (f" (off: {', '.join(off)})" if off else "")

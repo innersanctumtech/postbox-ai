@@ -21,6 +21,7 @@ import asyncio
 import collections
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -166,6 +167,16 @@ def message_age_s(hdr, queue_age, now=None):
         if 1_500_000_000 <= sent <= now + 300:   # not from before 2017 and not from the future (a few minutes of clock difference is allowed)
             return max(0, int(now - sent))
     return queue_age
+
+
+def original_sent_timestamp(headers, now=None):
+    """Return a plausible nonfuture original send time, or None when the header cannot establish one."""
+    now = time.time() if now is None else now
+    value = str((headers or {}).get("Sent-At", ""))
+    if not re.fullmatch(r"[0-9]{9,11}", value):
+        return None
+    sent = int(value)
+    return float(sent) if 1_500_000_000 <= sent <= now else None
 
 
 def busy_kinds(notes):
@@ -379,7 +390,22 @@ def _handoff_fence():
     return fence
 
 
-async def fenced_deliver(m, door, target, body, message_id):
+class HeldDeliveryExpired(Exception):
+    """A held message reached its retention deadline before inbox handoff."""
+
+
+def deliver_inbox_before_deadline(door, target, body, deadline, original_sent_at=None):
+    """Deliver inbox mail only while its original retention window remains open."""
+    if time.time() >= deadline:
+        return False
+    if isinstance(door, lib.InboxOnlyDoor):
+        door.deliver(target, body, original_sent_at=original_sent_at)
+    else:
+        door.deliver(target, body)
+    return True
+
+
+async def fenced_deliver(m, door, target, body, message_id, *, deadline=None, original_sent_at=None):
     """Reserve one broker delivery before its side effect; never repeat uncertainty."""
     _attempts, _age, sequence = msg_facts(m)
     if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
@@ -391,7 +417,13 @@ async def fenced_deliver(m, door, target, body, message_id):
         return False
     if state != "new" or not token:
         raise handoff_fence.FenceError("previous handoff outcome is uncertain")
-    await asyncio.to_thread(door.deliver, target, body)
+    if deadline is None:
+        await asyncio.to_thread(door.deliver, target, body)
+    else:
+        sent = await asyncio.to_thread(deliver_inbox_before_deadline, door, target, body, deadline, original_sent_at)
+        if not sent:
+            await asyncio.to_thread(fence.cancel_before_send, stream, sequence, m.subject, str(message_id), token)
+            raise HeldDeliveryExpired("held message expired before handoff")
     await asyncio.to_thread(fence.accept, stream, sequence, m.subject, str(message_id), token)
     return True
 
@@ -556,7 +588,7 @@ async def ring_wake(door, agent, project, from_addr):
     ("" when the agent has no wake entry, so its answer is exactly as before). The mail is already stored and acknowledged; whatever happens
     here only changes the sentence, never the delivery."""
     try:
-        if not getattr(door, "inbox_only", False) or not WAKER.configured(agent, project):
+        if not getattr(door, "wakeable", False) or not WAKER.configured(agent, project):
             return ""
         waiting = len(await asyncio.to_thread(lib.inbox_list, agent, project))
         result = await asyncio.to_thread(WAKER.wake, agent, project, from_addr, waiting)
@@ -610,6 +642,7 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
              "probe": (project, agent) == ("selfcheck", "selfcheck"), "attempts": attempts, "queue_age_s": queue_age,
              "bad_reply_inbox": bad_inbox, **tel.text_facts(text), "bytes": len(m.data)}
     waited = message_age_s(hdr, queue_age)
+    sent_at = original_sent_timestamp(hdr)
     stale = waited is not None and waited > lib.STALE_AFTER_S
     if stale:
         facts.update(stale=True, waited_s=int(waited))
@@ -676,6 +709,9 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
         await refuse("bad_session", f"'{str(want_raw)[:40]}' is not a usable session name: use the name `post who` shows after the #, letters, digits and hyphens", "refused_bad_session")
         return
     held = None
+    held_sent_at = None
+    held_deadline = None
+    copilot_inbox = isinstance(door, lib.CopilotDoor)
     if pick_id:   # post pick <id> <to>: send a held message on to ONE session. The pick message itself carries no text of its own.
         held = await asyncio.to_thread(lib.hold_get, pick_id)
         if held is None:
@@ -691,6 +727,23 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
             await refuse("pick_no_session", f"post pick needs the session to send it to, after a #: post pick {held['id']} {agent}@{project}#<name>", "refused_pick")
             return
         text = held["text"]   # the HELD message is what gets delivered, as its original sender wrote it
+        if copilot_inbox:
+            try:
+                raw_sent_at = held.get("sent_at")
+                if isinstance(raw_sent_at, bool) or raw_sent_at is None:
+                    raise ValueError
+                held_sent_at = float(raw_sent_at)
+                if held_sent_at <= 0 or not math.isfinite(held_sent_at):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                await refuse("pick_expired", "The held message has no valid original send time; no message was delivered.", "refused_pick")
+                return
+            now = time.time()
+            held_sent_at = min(held_sent_at, now)
+            held_deadline = held_sent_at + lib.MAX_AGE_S
+            if now >= held_deadline:
+                await refuse("pick_expired", "The held message expired before handoff; no message was delivered.", "refused_pick")
+                return
         from_label = held["frm"] + (f"#{held['session']}" if held.get("session") else "")
         stale = False         # a person or agent just chose the session: the message is current, a "still relevant?" banner would only get in the way
         facts.pop("stale", None)
@@ -807,7 +860,10 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
                     continue
                 await asyncio.to_thread(lib.codex_watch_reserve, watch_id, t, body, from_addr, from_session)
             if len(targets) == 1:
-                await fenced_deliver(m, door, t, body, watch_id)
+                await fenced_deliver(m, door, t, body, watch_id,
+                                     deadline=(held_deadline if pick_id else
+                                               sent_at + lib.MAX_AGE_S if sent_at is not None and copilot_inbox else None),
+                                     original_sent_at=(held_sent_at if pick_id else sent_at) if copilot_inbox else None)
             else:
                 # Legacy/custom doors may intentionally fan one publication out
                 # to multiple recipients; the durable fence key is per broker
@@ -822,6 +878,12 @@ async def handle(nc, m, doors=None, limiter=None, recipient_limiter=None):
                     log("relay_error", error="codex watch failed: " + repr(e)[:120])
             if note:
                 notes.append(note)
+        except HeldDeliveryExpired:
+            if pick_id:
+                await refuse("pick_expired", "The held message expired before handoff; no message was delivered.", "refused_pick")
+            else:
+                await refuse("expired", "The message expired before inbox handoff; no message was delivered.", "refused_expired")
+            return
         except Exception as e:  # noqa: BLE001
             failed.append(f"{t.label}: {e!r}")
             fail_classes.append(type(e).__name__)
@@ -1123,7 +1185,7 @@ async def answer_who(nc, msg):
         rows.append(row)
     body = {"machine": lib.my_machine(), "sessions": rows,
             "inbox_only": [{"agent": agent, "project": project, "waiting": waiting}
-                           for agent, project, waiting in lib.inbox_only_agents()]}
+                           for agent, project, waiting in lib.inbox_only_destination_depths()]}
     await nc.publish(msg.reply, json.dumps(body).encode())
     await nc.flush(timeout=2)
     tel.emit("post_who", "relay", side="answered", sessions_n=len(sessions), by_agent=dict(collections.Counter(s.agent for s in sessions)))

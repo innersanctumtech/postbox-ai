@@ -28,7 +28,7 @@ python3 install.py --dry-run
 python3 install.py
 ```
 
-`--dry-run` prints the plan and changes nothing. Among its lines are `doors on           : claude (off: codex, grok, grokbot-desktop)   (postbox/doors.py)` and `would install the Claude skill -> ~/.claude/skills/post/SKILL.md`. The real run takes about a minute and does this:
+`--dry-run` prints the plan and changes nothing. Among its lines are `doors on           : claude (off: codex, grok, grokbot-desktop, copilot)   (postbox/doors.py)` and `would install the Claude skill -> ~/.claude/skills/post/SKILL.md`. The real run takes about a minute and does this:
 
 1. Installs `nats-server` with Homebrew if it is missing.
 2. Builds `.venv` in the repo and installs the two Python packages from `requirements.txt` (`nats-py`, `nkeys`).
@@ -151,7 +151,7 @@ Open sessions: algorithm, tests. Next time name one: post claude@project-a#<name
 
 Every project has its own mailbox. Your project is, in this order: a `post join <project>` you ran in this session; else the nearest `.postbox-project` file (first line = the name) in your folder or above it; else the name of your folder. `post whoami` and `post who` say which. If the folder name is the wrong project, run `post join <project>` once (it lasts until the session exits; `post leave` undoes it). Never run `post join` for another session.
 
-## 8. Enable other doors (Codex, Grok, Grok Bot desktop)
+## 8. Enable other doors (Codex, Grok, Grok Bot desktop, Copilot)
 
 All door code is in the repo and tested. The switch is one file, `postbox/doors.py`:
 
@@ -161,6 +161,7 @@ ENABLED_DOORS = {
     # "codex",            # OpenAI Codex CLI (needs `codex` on PATH)
     # "grok",             # xAI Grok CLI (inbox file, no wake)
     # "grokbot-desktop",  # Grok Bot desktop via webhook (needs wake.json)
+    # "copilot",          # GitHub Copilot inbox (no wake)
 }
 ```
 
@@ -174,6 +175,7 @@ Notes:
 - The environment variable `POSTBOX_DOORS=claude,codex` overrides the file for any process you start by hand (tests, a relay run in a terminal). The launchd relay does not get it, so for the installed service edit the file.
 - For Codex also add the post rule to `~/.codex/AGENTS.md`: "To message another agent session, run the shell command `post <agent>[@project] "<message>"`. Typing it in chat sends nothing. After sending, end your turn: the reply arrives as a new message."
 - Grok cannot be woken: its mail waits in an inbox and Grok reads it with `post inbox`. Grok Bot desktop is addressed as `grokbot-desktop@<project>`, reads its mail the same way, and can be rung by a webhook configured in `wake.json` (see `examples/wake.json.example` and README.md).
+- Copilot uses a project inbox because Postbox cannot discover or wake its sessions. Enable the door, then use `post --as copilot@project-a inbox` to register and read it. Use `post --as copilot@project-a <to> "<message>"` to send as Copilot. See [GitHub Copilot](docs/COPILOT.md).
 
 ## 9. Link two Macs (optional)
 
@@ -198,6 +200,8 @@ Needs Tailscale signed in on both Macs and the post box installed on both. Only 
 | `nats-server is not installed and Homebrew was not found` | No Homebrew | Install Homebrew, run the installer again |
 | `post: no other Mac called 'mac-b' is linked` | The Mac is not linked | Section 9 |
 | `refused: ... no delivery door for agent '...'` | Door switched off | Section 8 |
+| `refused: The message expired before inbox handoff; no message was delivered.` (`expired`) | A Copilot inbox message's valid original send time is past the seven-day limit; a sender clock far behind can trigger this. | Check the sender clock and send a fresh message. |
+| `refused: The held message expired before handoff; no message was delivered.` (`pick_expired`) | A Copilot inbox pick reached its original seven-day limit before handoff; normal Copilot routing is single-target and does not hold ambiguous sends. | Send a fresh message; picking the expired one again will not deliver it. |
 | You edited `postbox/doors.py` and nothing changed | The relay still runs the old door set | `python3 install.py` |
 
 Restart the relay without reinstalling: `launchctl kickstart -k gui/$(id -u)/com.postbox.relay`.
@@ -211,4 +215,4 @@ fail=0; for t in tests/test_*.py; do .venv/bin/python "$t" || { echo "FAILED: $t
 python3 tools/scrub_check.py        # fails if a private string, address or 1Password reference is in the tree
 ```
 
-Each suite that passes prints `N passed, 0 failed`, `ALL PASSED` or `OK` and exits 0; the loop runs every suite and its last command exits non-zero if any suite failed. The suites need `nats-server` on the PATH for the end-to-end cases. **Run the suites from a normal Terminal window on macOS, not inside another sandbox (an AI tool's own sandbox counts).** They need `/usr/bin/sandbox-exec`: if the guard cannot set up its `sandbox-exec` layer, a suite that imports `tests/_guard.py` stops with exit code 3 and says why, and no setting turns the layer off. 32 of the 38 suites import `_env` or `_guard`; the six without those imports are the guard and scrub self-checks plus four portable helper suites without mailbox or process access. Protected ports: 4222, the ports in the launchd job files in `~/Library/LaunchAgents`, and `PBGUARD_PORTS`. Not covered: another host, a post box you started by hand on an unlisted port, a `PBGUARD_PORTS` set after the run started, a new suite that does not import `_env` or `_guard`. `test_doors.py`, `test_hardening.py`, `test_install.py`, `test_link.py` and `test_session_addressing_e2e.py` start their own `nats-server` on a private port, and `test_doors.py`, `test_install.py` and `test_link.py` also run `install.py` with `--no-launchd` in a throwaway home. On a Mac with a live post box, run only the suites you need, and do not run `post` or `launchctl` to check the result. Internals: the docstrings at the top of `tests/_guard.py` and `tests/test_env_guard.py`; the README section "Tests" has the same points as a list.
+Each suite that passes prints `N passed, 0 failed`, `ALL PASSED` or `OK` and exits 0; the loop runs every suite and its last command exits non-zero if any suite failed. The suites need `nats-server` on the PATH for the end-to-end cases. **Run the suites from a normal Terminal window on macOS, not inside another sandbox (an AI tool's own sandbox counts).** They need `/usr/bin/sandbox-exec`: if the guard cannot set up its `sandbox-exec` layer, a suite that imports `tests/_guard.py` stops with exit code 3 and says why, and no setting turns the layer off. 33 of the 39 suites import `_env` or `_guard`; the six without those imports are the guard and scrub self-checks plus four portable helper suites without mailbox or process access. Protected ports: 4222, the ports in the launchd job files in `~/Library/LaunchAgents`, and `PBGUARD_PORTS`. Not covered: another host, a post box you started by hand on an unlisted port, a `PBGUARD_PORTS` set after the run started, a new suite that does not import `_env` or `_guard`. `test_doors.py`, `test_hardening.py`, `test_install.py`, `test_link.py` and `test_session_addressing_e2e.py` start their own `nats-server` on a private port, and `test_doors.py`, `test_install.py` and `test_link.py` also run `install.py` with `--no-launchd` in a throwaway home. On a Mac with a live post box, run only the suites you need, and do not run `post` or `launchctl` to check the result. Internals: the docstrings at the top of `tests/_guard.py` and `tests/test_env_guard.py`; the README section "Tests" has the same points as a list.

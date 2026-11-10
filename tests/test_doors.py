@@ -64,13 +64,13 @@ print("the switch")
 text = (ROOT / "postbox" / "doors.py").read_text()
 lines = [ln.strip() for ln in text.splitlines()]
 check("shipped list: claude is the only active line", any(ln.startswith('"claude"') for ln in lines)
-      and not any(ln.startswith(('"codex"', '"grok"', '"grokbot-desktop"')) for ln in lines))
-check("codex, grok and grokbot-desktop lines are present but commented out",
-      all(any(ln.startswith(f'# "{name}"') for ln in lines) for name in ("codex", "grok", "grokbot-desktop")))
+      and not any(ln.startswith(('"codex"', '"grok"', '"grokbot-desktop"', '"copilot"')) for ln in lines))
+check("other door lines are present but commented out",
+      all(any(ln.startswith(f'# "{name}"') for ln in lines) for name in ("codex", "grok", "grokbot-desktop", "copilot")))
 code, out, err = child("import doors; print(sorted(doors.enabled_names()))")
 check("default: only claude is enabled", code == 0 and out == "['claude']", out + err)
-code, out, err = child("import doors; print(doors.enabled('claude'), doors.enabled('codex'), doors.enabled('grok'), doors.enabled('grokbot-desktop'), doors.enabled('gemini'))")
-check("default: enabled() says yes for claude, no for everything else", out == "True False False False False", out + err)
+code, out, err = child("import doors; print(doors.enabled('claude'), doors.enabled('codex'), doors.enabled('grok'), doors.enabled('grokbot-desktop'), doors.enabled('copilot'), doors.enabled('gemini'))")
+check("default: enabled() says yes for claude, no for everything else", out == "True False False False False False", out + err)
 code, out, err = child("import doors; print(sorted(doors.enabled_names()))", POSTBOX_DOORS="claude,codex")
 check("POSTBOX_DOORS=claude,codex enables codex", out == "['claude', 'codex']", out + err)
 code, out, err = child("import doors; print(sorted(doors.enabled_names()))", POSTBOX_DOORS=" Claude , GROK ,, ")
@@ -78,13 +78,13 @@ check("POSTBOX_DOORS ignores case, spaces and empty items", out == "['claude', '
 code, out, err = child("import doors; print(sorted(doors.enabled_names()))", POSTBOX_DOORS="")
 check("POSTBOX_DOORS set to nothing means no door at all (an explicit choice, not a fall back)", out == "[]", out + err)
 code, out, err = child("import doors; print(doors.describe())")
-check("describe() names what is on and what is off", out == "claude (off: codex, grok, grokbot-desktop)", out + err)
+check("describe() names what is on and what is off", out == "claude (off: codex, grok, grokbot-desktop, copilot)", out + err)
 
 print("the code follows the switch")
 code, out, err = child("import lib; print(sorted(lib.DOORS))")
 check("lib.DOORS holds only the claude door by default", out == "['claude']", out + err)
-code, out, err = child("import lib; print(sorted(lib.DOORS))", POSTBOX_DOORS="claude,codex,grok,grokbot-desktop")
-check("lib.DOORS holds all four doors when all are switched on", out == "['claude', 'codex', 'grok', 'grokbot-desktop']", out + err)
+code, out, err = child("import lib; print(sorted(lib.DOORS))", POSTBOX_DOORS="claude,codex,grok,grokbot-desktop,copilot")
+check("lib.DOORS holds every door when all are switched on", out == "['claude', 'codex', 'copilot', 'grok', 'grokbot-desktop']", out + err)
 code, out, err = child("""
 import lib
 from unittest import mock
@@ -113,7 +113,7 @@ check("with the codex door on, the same marker is looked at (and its failure rec
 
 print("help text")
 r = subprocess.run([PY, str(ROOT / "postbox" / "post.py"), "--help"], env=clean_env(), capture_output=True, text=True, timeout=60)
-check("post --help ends with the doors that are on", r.returncode == 0 and "Doors on: claude (off: codex, grok, grokbot-desktop)" in r.stdout, r.stdout[-300:] + r.stderr)
+check("post --help ends with the doors that are on", r.returncode == 0 and "Doors on: claude (off: codex, grok, grokbot-desktop, copilot)" in r.stdout, r.stdout[-300:] + r.stderr)
 check("post --help does not offer wake-test while grokbot-desktop is off", "wake-test" not in r.stdout)
 r = subprocess.run([PY, str(ROOT / "postbox" / "post.py"), "--help"], env=clean_env(POSTBOX_DOORS="claude,grokbot-desktop"), capture_output=True, text=True, timeout=60)
 check("post --help offers wake-test once grokbot-desktop is on", "wake-test" in r.stdout and "Doors on: claude, grokbot-desktop" in r.stdout, r.stdout[-300:])
@@ -146,7 +146,7 @@ with tempfile.TemporaryDirectory() as tmp:
     code, out = install(env, "--dry-run", "--port", str(free_port()))
     check("install --dry-run (default doors): mentions the Claude skill", code == 0 and "Claude skill" in out and "would install the Claude skill" in out, out[-500:])
     check("install --dry-run (default doors): no Codex skill, though ~/.codex/skills exists", "Codex skill" not in out and ".codex" not in out, out)
-    check("install --dry-run (default doors): names the doors that are on", "claude (off: codex, grok, grokbot-desktop)" in out, out)
+    check("install --dry-run (default doors): names the doors that are on", "claude (off: codex, grok, grokbot-desktop, copilot)" in out, out)
     check("install --dry-run changed nothing", not (home / ".claude" / "skills").exists() and not (home / ".local").exists())
     check("install --dry-run without POSTBOX_DOORS: no warning about it", "WARNING" not in out, out)
 with tempfile.TemporaryDirectory() as tmp:

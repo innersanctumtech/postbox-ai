@@ -1,5 +1,14 @@
 # History
 
+## 2.1.0
+
+- Adds the optional GitHub Copilot inbox door. A Copilot reader identifies itself with `post --as copilot@<project>`; its first inbox read registers an empty inbox so the project can receive mail before any message has arrived.
+- Reports inbox-only destinations by their own agent name. Ordinary Copilot routing has one inbox destination, so it is not held for ambiguous-session selection.
+- Enforces the seven-day limit using a valid original Copilot send time; missing, malformed, or future timestamps use inbox arrival time. A sender clock more than seven days behind can trigger an expired refusal. A Copilot inbox pick requires a valid send time, clamps a future time to arrival, and returns `pick_expired` after the original limit.
+- Keeps the default door set unchanged: only Claude is enabled until an operator enables another door in `postbox/doors.py`.
+
+This release provides inbox storage and reading instructions. It does not wake a Copilot session or confirm that Copilot read a message.
+
 ## 2.0.0
 
 Postbox 2.0.0 carries portable v0.3.2 functionality in the public project structure.

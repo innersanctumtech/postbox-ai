@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import re
 import socket
@@ -1044,12 +1045,24 @@ def inbox_list(agent, project, now=None):
     return live
 
 
-def inbox_put(agent, project, text, now=None):
+def inbox_put(agent, project, text, now=None, original_sent_at=None):
     """Store one message. Raises InboxFull at the cap (the sender's message then stays queued and is retried), ValueError if too big."""
     now = time.time() if now is None else now
     data = str(text).encode("utf-8", "replace")
     if len(data) > INBOX_MAX_BYTES:
         raise ValueError(f"message too big for an inbox ({len(data)} bytes, the limit is {INBOX_MAX_BYTES})")
+    if original_sent_at is None:
+        arrived_at = now
+    else:
+        try:
+            if isinstance(original_sent_at, bool):
+                raise ValueError
+            arrived_at = float(original_sent_at)
+        except (TypeError, ValueError, OverflowError) as e:
+            raise ValueError("invalid original send time") from e
+        if not math.isfinite(arrived_at) or arrived_at <= 0:
+            raise ValueError("invalid original send time")
+        arrived_at = min(arrived_at, now)
     folder = inbox_dir(agent, project)
     inbox_root().mkdir(mode=0o700, parents=True, exist_ok=True)
     folder.mkdir(mode=0o700, exist_ok=True)
@@ -1059,7 +1072,7 @@ def inbox_put(agent, project, text, now=None):
                        limit=INBOX_MAX_MESSAGES)
         raise InboxFull(f"inbox full ({INBOX_MAX_MESSAGES} unread messages); it is retried once the session reads some")
     tmp = folder / f".tmp-{uuid.uuid4().hex[:12]}"
-    final = folder / f"{int(now * 1000):013d}-{uuid.uuid4().hex[:12]}.msg"
+    final = folder / f"{int(arrived_at * 1000):013d}-{uuid.uuid4().hex[:12]}.msg"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as fh:
         fh.write(data)
@@ -2331,42 +2344,111 @@ class InboxSession(Session):
         return f"{self.agent}@{self.project} (inbox)"
 
 
-class GrokbotDesktopDoor:
-    """The agents inside Grok Bot desktop (a different app from the `grok` command line tool). Grok Bot desktop keeps no
-    session list the box can read, so there is no discovery: it is known only by stating who it is (`post --as grokbot-desktop@<project>`
-    or POSTBOX_AS), it cannot be woken, and it reads its mail with `POSTBOX_AS=grokbot-desktop@<project> post inbox`. A message for
-    grokbot-desktop@<project> is therefore always `delivered` into that inbox (never "nobody reachable"), with the note that it is read later."""
-    agent = "grokbot-desktop"
-    inbox_only = True           # post who lists it from its inbox, not from a session list
-    render_with_project = True  # the reading and answering commands name the project, because the agent has to state it
+class InboxOnlyDoor:
+    """An agent whose only delivery endpoint is a project inbox it reads itself."""
+    agent = ""
+    inbox_only = True
+    render_with_project = True
+    register_on_read = False
+    wakeable = False
 
     def resolve(self, project, exclude_pid=None, sessions=None):
         return [InboxSession(self.agent, 0, "", canon_project(project), "inbox")]
 
     def busy_note(self, session, now=None):
-        return f"{self.agent} cannot be woken: it reads this with `POSTBOX_AS={self.agent}@{session.project} post inbox` when its next turn starts"
+        return f"{self.agent} cannot be woken: it reads this with `{self.read_cmd(session.project)}` when its next turn starts"
+
+    def read_cmd(self, project):
+        return f"POSTBOX_AS={self.agent}@{project} post inbox"
 
     def render(self, from_addr, text, waited_s=None, project=None):
         me = f"{self.agent}@{project}" if project else f"{self.agent}@<project>"
-        return render(from_addr, text, inbox=True, waited_s=waited_s, cmd=f"post --as {me}", inbox_cmd=f"POSTBOX_AS={me} post inbox")
+        return render(from_addr, text, inbox=True, waited_s=waited_s, cmd=f"post --as {me}",
+                      inbox_cmd=self.read_cmd(project or "<project>"))
 
-    def deliver(self, session, text, timeout=None):
-        inbox_put(self.agent, session.project, text)
+    def deliver(self, session, text, timeout=None, *, original_sent_at=None):
+        inbox_put(self.agent, session.project, text, original_sent_at=original_sent_at)
 
 
-_ALL_DOORS = {"claude": ClaudeDoor, "codex": CodexDoor, "grok": GrokDoor, "grokbot-desktop": GrokbotDesktopDoor}
+class GrokbotDesktopDoor(InboxOnlyDoor):
+    """The agents inside Grok Bot desktop (a different app from the `grok` command line tool). Grok Bot desktop keeps no
+    session list the box can read, so there is no discovery: it is known only by stating who it is (`post --as grokbot-desktop@<project>`
+    or POSTBOX_AS), it cannot be woken, and it reads its mail with `POSTBOX_AS=grokbot-desktop@<project> post inbox`. A message for
+    grokbot-desktop@<project> is therefore always `delivered` into that inbox (never "nobody reachable"), with the note that it is read later."""
+    agent = "grokbot-desktop"
+    inbox_only = True
+    render_with_project = True
+    wakeable = True
+
+
+class CopilotDoor(InboxOnlyDoor):
+    """GitHub Copilot reads project mail explicitly; the box cannot discover or wake its sessions."""
+    agent = "copilot"
+    register_on_read = True
+
+    def read_cmd(self, project):
+        return f"post --as {self.agent}@{project} inbox"
+
+
+_ALL_DOORS = {"claude": ClaudeDoor, "codex": CodexDoor, "grok": GrokDoor,
+              "grokbot-desktop": GrokbotDesktopDoor, "copilot": CopilotDoor}
 DOORS = {name: cls() for name, cls in _ALL_DOORS.items() if doors.enabled(name)}   # only the doors postbox/doors.py (or POSTBOX_DOORS) switches on
 
 
 def inbox_only_agents():
-    """[(agent, project, waiting)] for every agent whose door has no session list (grokbot-desktop) and whose inbox exists, sorted. post who shows these."""
-    names = {a for a, d in DOORS.items() if getattr(d, "inbox_only", False)}
+    """[(agent, raw project folder, waiting)] for the existing local post who listing."""
+    names = {agent for agent, door in DOORS.items() if getattr(door, "inbox_only", False)}
     found = []
     for name, waiting in sorted(inbox_depths().items()):
-        agent, _, project = name.partition(".")
-        if agent in names and project:
+        agent, separator, project = name.partition(".")
+        if separator and project and agent in names:
             found.append((agent, project, waiting))
     return found
+
+
+def inbox_register(agent, project):
+    """Create an empty inbox only for doors that register themselves when they first read."""
+    door = DOORS.get(norm(agent))
+    if not getattr(door, "register_on_read", False):
+        return False
+    try:
+        inbox_root().mkdir(mode=0o700, parents=True, exist_ok=True)
+        inbox_dir(agent, project).mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def inbox_only_destination_depths():
+    """Sorted (agent, canonical project, waiting) rows for relay discovery."""
+    names = {agent for agent, door in DOORS.items() if isinstance(door, InboxOnlyDoor)}
+    try:
+        entries = list(inbox_root().iterdir())
+    except OSError:
+        entries = []
+    found = {}
+    for entry in entries:
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        agent, separator, project = entry.name.partition(".")
+        if separator and project and agent in names:
+            try:
+                waiting = sum(1 for name in os.listdir(entry) if INBOX_NAME_RE.match(name))
+            except OSError:
+                waiting = 0
+            key = (agent, canon_project(project))
+            found[key] = found.get(key, 0) + waiting
+    return [(agent, project, waiting) for (agent, project), waiting in sorted(found.items())]
+
+
+def inbox_only_destinations():
+    """Sorted (agent, canonical project) pairs for inbox-only doors with an inbox folder."""
+    return [(agent, project) for agent, project, _waiting in inbox_only_destination_depths()]
+
+
+def inbox_only_projects():
+    """Sorted canonical projects with an inbox-only destination on this Mac."""
+    return sorted({project for _agent, project in inbox_only_destinations()})
 
 
 # ---------------------------------------------------------------- choosing ONE session, holding a message that did not say which

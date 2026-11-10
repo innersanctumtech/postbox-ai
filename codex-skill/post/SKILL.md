@@ -5,7 +5,7 @@ description: Use when the user asks you to message, tell, or ask another agent s
 
 # post - message another agent session
 
-Postbox 2.0.0 reports delivery only when it has evidence that the message reached the intended conversation. Codex screens are matched to exact conversations, including when several screens are open. If the destination cannot be proven or the handoff is uncertain, preserve the reported status and do not guess or resend automatically.
+Postbox 2.1.0 reports delivery only when it has evidence that the message reached the intended conversation or inbox. Codex screens are matched to exact conversations, including when several screens are open. If the destination cannot be proven or the handoff is uncertain, preserve the reported status and do not guess or resend automatically. The optional GitHub Copilot door is inbox-only: `delivered:` means stored for later reading, not read.
 
 Run this shell command (typing it in chat sends nothing):
 

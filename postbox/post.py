@@ -281,7 +281,11 @@ def cmd_who(rest):
             print("      last delivery not seen")
     wake_entries = wake.load_wake()
     for agent, project, waiting in inbox_agents:
-        print(f"  {agent}@{project:<24} (inbox, {waiting} waiting; cannot be woken)  wake: {'configured (own webhook)' if wake.wake_key(agent, project) in wake_entries else 'configured' if wake.wake_key(agent) in wake_entries else 'not configured'}")
+        line = f"  {agent}@{project:<24} (inbox, {waiting} waiting; cannot be woken)"
+        if getattr(lib.DOORS.get(agent), "wakeable", False):
+            wake_status = "configured (own webhook)" if wake.wake_key(agent, project) in wake_entries else "configured" if wake.wake_key(agent) in wake_entries else "not configured"
+            line += f"  wake: {wake_status}"
+        print(line)
     if not sessions and not inbox_agents:
         print("  (none)")
     others = sorted(lib.load_link().get("peers") or {})
@@ -584,6 +588,10 @@ def cmd_status(args):
 
 def cmd_inbox(rest, me):
     agent, project = me[0], lib.norm(me[1])
+    valid_modes = (not rest) or rest == ["--history"] or rest == ["--watch"]
+    if not valid_modes:
+        die("post inbox takes no words (post inbox, post inbox --history, or post inbox --watch)", reason="bad_usage")
+    lib.inbox_register(agent, project)
     if rest and rest[0] == "--watch" and len(rest) == 1:
         note(op="watch")
         emit_command(0)   # one event when the doorbell starts: it runs until stopped, and a stopped process cannot report
@@ -607,8 +615,6 @@ def cmd_inbox(rest, me):
             stamp = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))   # noqa: E731
             print(f"\n--- message {number} (arrived {stamp(arrived_at)}, read {stamp(read_at)}) ---\n{text}", flush=True)
         return
-    if rest:
-        die("post inbox takes no words (post inbox, post inbox --history, or post inbox --watch)", reason="bad_usage")
     waiting = len(lib.inbox_list(agent, project))
     note(op="take" if waiting else "empty", waiting=waiting)
     if not waiting:
